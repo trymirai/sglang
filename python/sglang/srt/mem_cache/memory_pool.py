@@ -54,6 +54,7 @@ from sglang.srt.layers.utils.dcp_utils import (
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
+    copy_prefix_valid_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
 )
 from sglang.srt.mem_cache.utils import (
@@ -1855,6 +1856,74 @@ class MHATokenToKVPool(KVCache):
                 num_stages=2,
             )
 
+    def move_kv_cache_prefix_valid(
+        self,
+        tgt_loc_2d: torch.Tensor,
+        src_loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ):
+        """Copy the accepted DFlash prefix."""
+        if self.layer_num == 0:
+            return
+        if tgt_loc_2d.shape != src_loc_2d.shape or tgt_loc_2d.ndim != 2:
+            raise ValueError(
+                "prefix-valid KV move expects matching 2D location tensors, "
+                f"got tgt={tuple(tgt_loc_2d.shape)} src={tuple(src_loc_2d.shape)}"
+            )
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != tgt_loc_2d.shape[0]:
+            raise ValueError(
+                "prefix-valid KV move expects one commit length per batch row, "
+                f"got commit_lens={tuple(commit_lens.shape)}"
+            )
+
+        batch_size, block_size = tgt_loc_2d.shape
+        num_locs = int(batch_size * block_size)
+        if num_locs == 0:
+            return
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(
+            tgt_loc_2d,
+            0,
+            size_limit,
+            "move_kv_cache_prefix_valid tgt_loc",
+        )
+        maybe_detect_oob(
+            src_loc_2d,
+            0,
+            size_limit,
+            "move_kv_cache_prefix_valid src_loc",
+        )
+
+        if self.use_hnd or envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+            offsets = torch.arange(
+                block_size, device=tgt_loc_2d.device, dtype=torch.long
+            )[None, :]
+            valid = offsets < commit_lens.to(torch.long)[:, None]
+            self.move_kv_cache(
+                tgt_loc_2d[valid],
+                src_loc_2d[valid],
+            )
+            return
+
+        assert (
+            self._kv_copy_config is not None
+        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        cfg = self._kv_copy_config
+        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
+        copy_prefix_valid_layer_kv_cache_tiled[grid](
+            self.data_ptrs,
+            self.data_strides,
+            tgt_loc_2d,
+            src_loc_2d,
+            commit_lens,
+            num_locs,
+            block_size=int(block_size),
+            BLOCK_LOCS=triton.next_power_of_2(num_locs),
+            BYTES_PER_TILE=cfg["bytes_per_tile"],
+            num_warps=cfg["num_warps"],
+            num_stages=2,
+        )
+
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
     """KV cache pool that skips physical K/V buffer allocation.
@@ -2307,6 +2376,18 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def move_kv_cache_prefix_valid(
+        self,
+        tgt_loc_2d: torch.Tensor,
+        src_loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ):
+        self.full_kv_pool.move_kv_cache_prefix_valid(
+            tgt_loc_2d,
+            src_loc_2d,
+            commit_lens,
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)

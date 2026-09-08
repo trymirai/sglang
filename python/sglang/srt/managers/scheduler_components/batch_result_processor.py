@@ -633,6 +633,18 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+
+        if (
+            batch.spec_algorithm.is_dflash_tfm()
+            and result.new_seq_lens is not None
+            and result.accept_lens is not None
+            and batch.seq_lens_cpu is not None
+        ):
+            batch.seq_lens_cpu = batch.seq_lens_cpu + result.accept_lens.to(
+                dtype=batch.seq_lens_cpu.dtype
+            )
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

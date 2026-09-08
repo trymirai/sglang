@@ -1533,6 +1533,13 @@ class ServerArgs:
         Optional[int],
         "DFLASH_TFM only. Per-depth top-k candidate pool taken from the DFlash marginals. Defaults to the Weaver checkpoint's pool size.",
     ] = None
+    speculative_dflash_tfm_tree_sampling_mode: A[
+        str,
+        Arg(
+            help="DFLASH_TFM non-greedy tree verifier. 'target_only' verifies a deterministic tree by sampling from the target first. 'traversal' samples each sibling order without replacement and applies Traversal Verification residual updates.",
+            choices=["target_only", "traversal"],
+        ),
+    ] = "target_only"
     speculative_gdn_verify_kernel: A[
         str,
         Arg(

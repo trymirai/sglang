@@ -3277,8 +3277,14 @@ class Scheduler(
                 if batch_result.new_seq_lens is not None:
                     batch.seq_lens = batch_result.new_seq_lens
                     if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                        defer_cpu_seq_lens = (
+                            self.spec_algorithm.is_dflash_tfm()
+                            and batch.forward_mode.is_decode()
+                            and batch_result.accept_lens is not None
+                        )
+                        if not defer_cpu_seq_lens:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.

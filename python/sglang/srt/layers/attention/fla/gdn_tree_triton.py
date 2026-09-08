@@ -39,6 +39,8 @@ inside sqrt; q *= K^-0.5; ratio-form decay exp(prefix_i - prefix_j).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -86,6 +88,17 @@ def _gate(a, A_log, dt_bias, sp_beta, sp_thr):
 
 
 @triton.jit
+def _dot(a, b, precision: tl.constexpr, bf16_operands: tl.constexpr):
+    if bf16_operands:
+        return tl.dot(
+            a.to(tl.bfloat16),
+            b.to(tl.bfloat16),
+            out_dtype=tl.float32,
+        )
+    return tl.dot(a, b, input_precision=precision)
+
+
+@triton.jit
 def _k0_scalars_kernel(
     a_ptr, b_ptr, A_log_ptr, dt_bias_ptr, p_ptr,
     prefix_ptr, beta_ptr,
@@ -94,6 +107,7 @@ def _k0_scalars_kernel(
     stride_p_n,
     stride_s_n, stride_s_t,
     NB: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr,
+    BF16_K0: tl.constexpr,
 ):
     # prefix = P @ g for ALL heads at once: one [BT,BT]@[BT,BH] dot per
     # t-chunk (P is per-sequence — loading it per head wastes 48x traffic).
@@ -123,7 +137,7 @@ def _k0_scalars_kernel(
             m_t[:, None] & m_h[None, :],
             _gate(a_tile, A_log[None, :], dtb[None, :], sp_beta, sp_thr), 0.0,
         )
-        acc += tl.dot(p_tile, g_tile, input_precision="tf32x3")
+        acc += _dot(p_tile, g_tile, "tf32x3", BF16_K0)
 
     b_v = tl.load(
         b_ptr + i_n * stride_a_n + rows[:, None] * stride_a_t + hv[None, :],
@@ -148,7 +162,8 @@ def _k1_gram_kernel(
     stride_inv_nh, stride_inv_b,
     USE_L2NORM: tl.constexpr,
     NBT: tl.constexpr, BK: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
-    PREC: tl.constexpr, G: tl.constexpr,
+    PREC: tl.constexpr, G: tl.constexpr, MAX_DEPTH: tl.constexpr,
+    BF16_GRAM: tl.constexpr, BF16_INVERSE: tl.constexpr,
     tile_ptr=None,
 ):
     # lower-triangular tile grid: upper tiles (j > i) are identically zero
@@ -185,8 +200,8 @@ def _k1_gram_kernel(
         q_i = q_i / tl.sqrt(tl.sum(q_i * q_i, 1) + 1e-6)[:, None]
     q_i = q_i * scale
 
-    kk = tl.dot(k_i, tl.trans(k_j), input_precision=PREC)
-    qk = tl.dot(q_i, tl.trans(k_j), input_precision=PREC)
+    kk = _dot(k_i, tl.trans(k_j), PREC, BF16_GRAM)
+    qk = _dot(q_i, tl.trans(k_j), PREC, BF16_GRAM)
 
     p_tile = tl.load(
         p_ptr + i_n * stride_p_n + rows[:, None] * T + cols[None, :],
@@ -217,17 +232,20 @@ def _k1_gram_kernel(
             # lower) — repeated squaring covers j < 32 = BT
             n1 = -a_tile
             x = eye + n1
-            m2 = tl.dot(n1, n1, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            if BT > 32:  # one more squaring level covers j < 64
-                m2 = tl.dot(m2, m2, input_precision=PREC)
-                x = x + tl.dot(x, m2, input_precision=PREC)
+            m2 = _dot(n1, n1, PREC, BF16_INVERSE)
+            x = x + _dot(x, m2, PREC, BF16_INVERSE)
+            if MAX_DEPTH > 3:
+                m2 = _dot(m2, m2, PREC, BF16_INVERSE)
+                x = x + _dot(x, m2, PREC, BF16_INVERSE)
+            if MAX_DEPTH > 7:
+                m2 = _dot(m2, m2, PREC, BF16_INVERSE)
+                x = x + _dot(x, m2, PREC, BF16_INVERSE)
+            if MAX_DEPTH > 15:
+                m2 = _dot(m2, m2, PREC, BF16_INVERSE)
+                x = x + _dot(x, m2, PREC, BF16_INVERSE)
+            if MAX_DEPTH > 31:
+                m2 = _dot(m2, m2, PREC, BF16_INVERSE)
+                x = x + _dot(x, m2, PREC, BF16_INVERSE)
             inv_base = i_nh * stride_inv_nh + i_t * stride_inv_b
             tl.store(Ainv_ptr + inv_base + ij, x)
 
@@ -249,6 +267,7 @@ def _k2_solve_kernel(
     NB: tl.constexpr, BK: tl.constexpr, K: tl.constexpr,
     BV: tl.constexpr, V: tl.constexpr, BT: tl.constexpr,
     PREC: tl.constexpr,
+    BF16_STATE: tl.constexpr, BF16_FORWARD: tl.constexpr,
 ):
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -283,7 +302,7 @@ def _k2_solve_kernel(
         ).to(tl.float32)
         pre_b = tl.load(prefix_ptr + i_n * stride_s_n + rows * stride_s_t + i_hv, mask=m_r, other=0.0)
         beta_b = tl.load(beta_ptr + i_n * stride_s_n + rows * stride_s_t + i_hv, mask=m_r, other=0.0)
-        kh0 = tl.dot(k_b, h0, input_precision=PREC)
+        kh0 = _dot(k_b, h0, PREC, BF16_STATE)
         acc = beta_b[:, None] * (v_b - tl.exp(pre_b)[:, None] * kh0)
         for pb in tl.static_range(cur):
             pcols = pb * BT + tl.arange(0, BT)
@@ -293,9 +312,9 @@ def _k2_solve_kernel(
             u_blk = tl.load(
                 U_ptr + i_nh * stride_U_nh + pcols[:, None] * stride_U_t + offs_v[None, :]
             )
-            acc -= tl.dot(a_blk, u_blk, input_precision=PREC)
+            acc -= _dot(a_blk, u_blk, PREC, BF16_FORWARD)
         inv = tl.load(Ainv_ptr + i_nh * stride_inv_nh + cur * stride_inv_b + ij)
-        u_cur = tl.dot(inv, acc, input_precision=PREC)
+        u_cur = _dot(inv, acc, PREC, BF16_FORWARD)
         tl.store(
             U_ptr + i_nh * stride_U_nh + rows[:, None] * stride_U_t + offs_v[None, :], u_cur
         )
@@ -317,6 +336,7 @@ def _k3_out_kernel(
     NB: tl.constexpr, BK: tl.constexpr, K: tl.constexpr,
     BV: tl.constexpr, V: tl.constexpr, BT: tl.constexpr,
     PREC: tl.constexpr,
+    BF16_STATE: tl.constexpr, BF16_READOUT: tl.constexpr,
 ):
     i_t, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -347,7 +367,7 @@ def _k3_out_kernel(
             pre_i = tl.load(
                 prefix_ptr + i_n * stride_s_n + rows * stride_s_t + i_hv, mask=m_r, other=0.0
             )
-            acc = tl.exp(pre_i)[:, None] * tl.dot(q_i, h0, input_precision=PREC)
+            acc = tl.exp(pre_i)[:, None] * _dot(q_i, h0, PREC, BF16_STATE)
 
     for jt in range(0, i_t + 1):  # tiles with jt > i_t are zero (no ancestors above)
         cols = jt * BT + tl.arange(0, BT)
@@ -357,7 +377,7 @@ def _k3_out_kernel(
         u_blk = tl.load(
             U_ptr + i_nh * stride_U_nh + cols[:, None] * stride_U_t + offs_v[None, :]
         )
-        acc += tl.dot(qkd, u_blk, input_precision=PREC)
+        acc += _dot(qkd, u_blk, PREC, BF16_READOUT)
 
     tl.store(
         O_ptr + i_n * stride_o_n + rows[:, None] * stride_o_t + i_hv * stride_o_h + offs_v[None, :],
@@ -383,10 +403,14 @@ def tree_gdn_triton_verify(
     use_qk_l2norm_in_kernel: bool = False,
     return_lazy_state: bool = False,
     precision: str = "ieee",
+    bf16_mode: str | None = None,
 ):
     """Same contract as gdn_tree_fused.tree_gdn_fused_verify. precision:
     "ieee" = fp32-exact dots (validation); "tf32" = tensor cores (serving,
     ~2e-4 abs vs ieee — below bf16 input noise)."""
+    if bf16_mode is None:
+        bf16_mode = os.environ.get("SGLANG_GDN_TREE_BF16_OPERANDS", "none")
+
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     if scale is None:
@@ -400,6 +424,15 @@ def tree_gdn_triton_verify(
     NV = triton.cdiv(V, BV)
     G = HV // H
     dev = q.device
+    assert bf16_mode in {
+        "none", "gram", "state", "forward", "readout", "body", "solve", "all"
+    }
+    bf16_gram = bf16_mode != "none"
+    bf16_state = bf16_mode not in {"none", "gram"}
+    bf16_forward = bf16_mode in {"forward", "body", "solve", "all"}
+    bf16_readout = bf16_mode in {"readout", "body", "solve", "all"}
+    bf16_inverse = bf16_mode in {"solve", "all"}
+    bf16_k0 = bf16_mode == "all"
 
     p_u8 = tree.anc_u8  # [N, T, T], built once per verify step
     prefix = torch.empty(B, NBT, HV, device=dev, dtype=torch.float32)
@@ -417,7 +450,7 @@ def tree_gdn_triton_verify(
         a.stride(0), a.stride(1),
         p_u8.stride(0),
         prefix.stride(0), prefix.stride(1),
-        NB=NB, BT=BT, BH=BH,
+        NB=NB, BT=BT, BH=BH, BF16_K0=bf16_k0,
         num_warps=4,
     )
     _k1_gram_kernel[(n_tiles, B * H)](
@@ -430,6 +463,8 @@ def tree_gdn_triton_verify(
         Ainv.stride(0), Ainv.stride(1),
         USE_L2NORM=use_qk_l2norm_in_kernel,
         NBT=NBT, BK=BK, K=K, BT=BT, PREC=precision, G=G,
+        BF16_GRAM=bf16_gram, BF16_INVERSE=bf16_inverse,
+        MAX_DEPTH=tree.max_depth,
         tile_ptr=tile_t,
         num_warps=4,
     )
@@ -446,6 +481,7 @@ def tree_gdn_triton_verify(
         USE_L2NORM=use_qk_l2norm_in_kernel,
         USE_H0=initial_state_source is not None,
         NB=NB, BK=BK, K=K, BV=BV, V=V, BT=BT, PREC=precision,
+        BF16_STATE=bf16_state, BF16_FORWARD=bf16_forward,
         num_warps=8,
     )
     _k3_out_kernel[(NB, NV, B * HV)](
@@ -460,7 +496,8 @@ def tree_gdn_triton_verify(
         USE_L2NORM=use_qk_l2norm_in_kernel,
         USE_H0=initial_state_source is not None,
         NB=NB, BK=BK, K=K, BV=BV, V=V, BT=BT, PREC=precision,
-        num_warps=8,
+        BF16_STATE=bf16_state, BF16_READOUT=bf16_readout,
+        num_warps=4,
     )
 
     if return_lazy_state:

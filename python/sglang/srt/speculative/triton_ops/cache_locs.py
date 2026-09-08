@@ -67,6 +67,40 @@ def assign_req_to_token_pool_func(
 
 
 @triton.jit
+def assign_req_to_token_pool_dflash_dense(
+    req_pool_indices,
+    req_to_token,
+    start_offset,
+    commit_lens,
+    accepted_cache_loc_2d,
+    reserved_cache_loc_2d,
+    pool_len: tl.constexpr,
+    num_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    in_range = offsets < num_tokens
+    commit_len = tl.load(commit_lens + pid)
+    prefix = in_range & (offsets < commit_len)
+
+    accepted = tl.load(
+        accepted_cache_loc_2d + pid * num_tokens + offsets,
+        mask=prefix,
+        other=0,
+    )
+    reserved = tl.load(
+        reserved_cache_loc_2d + pid * num_tokens + offsets,
+        mask=in_range & ~prefix,
+        other=0,
+    )
+    values = tl.where(prefix, accepted, reserved)
+    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    dst = token_pool + tl.load(start_offset + pid) + offsets
+    tl.store(dst, values, mask=in_range)
+
+
+@triton.jit
 def assign_draft_cache_locs_contiguous(
     req_pool_indices,
     req_to_token,

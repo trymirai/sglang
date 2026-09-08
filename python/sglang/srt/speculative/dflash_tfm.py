@@ -34,7 +34,10 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_req_to_token_pool_dflash_dense,
+    assign_extend_cache_locs_func,
+)
 from sglang.srt.speculative.triton_ops.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
@@ -48,71 +51,242 @@ WEAVER_TREE_BATCH_EXPAND_BUDGET_UNIT = 16
 
 
 @triton.jit
-def _weaver_candidate_frontier_kernel(
-    logits_ptr,
-    candidate_ids_ptr,
-    prefix_score_ptr,
-    node_depth_ptr,
-    active_ptr,
+def _weaver_bitonic_step(
+    keys,
+    values,
+    valid,
+    lanes,
+    SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    FINAL: tl.constexpr,
+):
+    low_lanes = lanes - (lanes & STRIDE)
+    high_lanes = low_lanes + STRIDE
+    low_keys = tl.gather(keys, low_lanes, axis=0)
+    high_keys = tl.gather(keys, high_lanes, axis=0)
+    low_values = tl.gather(values, low_lanes, axis=0)
+    high_values = tl.gather(values, high_lanes, axis=0)
+    low_valid = tl.gather(valid, low_lanes, axis=0)
+    high_valid = tl.gather(valid, high_lanes, axis=0)
+
+    swap = ((low_keys > high_keys) & low_valid) | (~high_valid)
+    if FINAL:
+        direction = tl.full((32,), False, tl.int1)
+    else:
+        thread = (low_lanes // (2 * STRIDE)) * STRIDE + low_lanes % STRIDE
+        direction = (thread & (SIZE // 2)) != 0
+    swap = swap == direction
+    is_low = (lanes & STRIDE) == 0
+    keys = tl.where(
+        is_low,
+        tl.where(swap, high_keys, low_keys),
+        tl.where(swap, low_keys, high_keys),
+    )
+    values = tl.where(
+        is_low,
+        tl.where(swap, high_values, low_values),
+        tl.where(swap, low_values, high_values),
+    )
+    valid = tl.where(
+        is_low,
+        tl.where(swap, high_valid, low_valid),
+        tl.where(swap, low_valid, high_valid),
+    )
+    return keys, values, valid
+
+
+@triton.jit
+def _weaver_materialize_frontier_kernel(
     frontier_tokens_ptr,
     frontier_parents_ptr,
     frontier_depths_ptr,
     frontier_scores_ptr,
     frontier_logprobs_ptr,
     frontier_active_ptr,
+    slot_ancestors_ptr,
+    tokens_ptr,
+    parents_ptr,
+    depths_ptr,
+    node_mask_ptr,
+    draft_logprobs_ptr,
+    selected_tokens_ptr,
+    selected_depths_ptr,
+    selected_position_ids_ptr,
+    selected_candidate_rows_ptr,
+    selected_batch_indices_ptr,
+    selected_scores_ptr,
+    selected_active_ptr,
+    selected_parent_ancestors_ptr,
     slot_start,
-    WIDTH: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
-    EXPAND_WIDTH: tl.constexpr,
+    NUM_NODES: tl.constexpr,
     DEPTH: tl.constexpr,
     FRONTIER_SLOTS: tl.constexpr,
-    BLOCK_POOL: tl.constexpr,
+    SELECT_WIDTH: tl.constexpr,
+    SCRATCH_WIDTH: tl.constexpr,
+    BLOCK_DEPTH: tl.constexpr,
+    BLOCK_FRONTIER: tl.constexpr,
+    FRONTIER_LIMIT: tl.constexpr,
+    WRITE_ANCESTORS: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_POOL)
-    pool_mask = offsets < POOL_SIZE
-    row_base = row * POOL_SIZE + offsets
-    token_ids = tl.load(candidate_ids_ptr + row_base, mask=pool_mask, other=-1)
-    scores = tl.load(logits_ptr + row_base, mask=pool_mask, other=-float("inf")).to(
-        tl.float32
+    batch = tl.program_id(0)
+    selected_offset = tl.arange(0, 32)
+    selected_mask = selected_offset < SELECT_WIDTH
+    frontier_offset = tl.arange(0, BLOCK_FRONTIER)
+    frontier_mask = frontier_offset < FRONTIER_LIMIT
+    frontier_scores = tl.load(
+        frontier_scores_ptr + batch * FRONTIER_SLOTS + frontier_offset,
+        mask=frontier_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    frontier_scores = tl.where(
+        frontier_mask & (frontier_scores != -float("inf")),
+        frontier_scores,
+        -1.0e30,
     )
-    scores = tl.where((token_ids >= 0) & pool_mask, scores, -float("inf"))
-    parent_score = tl.load(prefix_score_ptr + row)
-    parent_depth = tl.load(node_depth_ptr + row)
-    parent_active = (tl.load(active_ptr + row) != 0) & (parent_depth < DEPTH)
-    batch = row // WIDTH
-    row_in_width = row - batch * WIDTH
-    max_score = tl.max(scores, axis=0)
-    exp_scores = tl.where(scores == -float("inf"), 0.0, tl.exp(scores - max_score))
-    log_denom = tl.log(tl.sum(exp_scores, axis=0)) + max_score
-    child_base = batch * FRONTIER_SLOTS + (slot_start + row_in_width) * EXPAND_WIDTH
-    child_depth = parent_depth + 1
-    for child in tl.static_range(0, EXPAND_WIDTH):
-        top_value, top_index = tl.max(
-            scores,
+    frontier_index = tl.full((32,), 0, tl.int32)
+    for pick in tl.static_range(0, SELECT_WIDTH):
+        _, top_index = tl.max(
+            frontier_scores,
             axis=0,
             return_indices=True,
             return_indices_tie_break_left=True,
         )
-        child_token = tl.load(candidate_ids_ptr + row * POOL_SIZE + top_index)
-        child_valid = parent_active & (child_token >= 0) & (top_value != -float("inf"))
-        out_index = child_base + child
-        tl.store(frontier_tokens_ptr + out_index, tl.where(child_valid, child_token, 0))
-        tl.store(
-            frontier_parents_ptr + out_index,
-            tl.where(child_valid, slot_start + row_in_width, 0),
+        frontier_index = tl.where(selected_offset == pick, top_index, frontier_index)
+        frontier_scores = tl.where(
+            frontier_offset == top_index, -float("inf"), frontier_scores
         )
-        tl.store(frontier_depths_ptr + out_index, tl.where(child_valid, child_depth, 0))
-        tl.store(
-            frontier_scores_ptr + out_index,
-            tl.where(child_valid, parent_score + top_value - log_denom, -float("inf")),
+    selected_index = batch * FRONTIER_SLOTS + frontier_index
+    score = tl.load(
+        frontier_scores_ptr + selected_index,
+        mask=selected_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sort_valid = selected_mask
+    for stage in tl.static_range(1, 5):
+        size = 1 << stage
+        for pass_index in tl.static_range(0, stage):
+            stride = size >> (pass_index + 1)
+            score, frontier_index, sort_valid = _weaver_bitonic_step(
+                score,
+                frontier_index,
+                sort_valid,
+                selected_offset,
+                SIZE=size,
+                STRIDE=stride,
+                FINAL=False,
+            )
+    for pass_index in tl.static_range(0, 5):
+        stride = 16 >> pass_index
+        score, frontier_index, sort_valid = _weaver_bitonic_step(
+            score,
+            frontier_index,
+            sort_valid,
+            selected_offset,
+            SIZE=32,
+            STRIDE=stride,
+            FINAL=True,
+        )
+
+    selected_index = batch * FRONTIER_SLOTS + frontier_index
+    valid = (
+        tl.load(frontier_active_ptr + selected_index, mask=selected_mask, other=0)
+        != 0
+    )
+    token = tl.load(frontier_tokens_ptr + selected_index, mask=selected_mask, other=0)
+    parent = tl.load(frontier_parents_ptr + selected_index, mask=selected_mask, other=0)
+    depth = tl.load(frontier_depths_ptr + selected_index, mask=selected_mask, other=0)
+    logprob = tl.load(
+        frontier_logprobs_ptr + selected_index,
+        mask=selected_mask,
+        other=-float("inf"),
+    )
+
+    output_index = batch * NUM_NODES + slot_start + selected_offset
+    tl.store(
+        tokens_ptr + output_index,
+        tl.where(valid, token, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        parents_ptr + output_index,
+        tl.where(valid, parent, -1),
+        mask=selected_mask,
+    )
+    tl.store(
+        depths_ptr + output_index,
+        tl.where(valid, depth, 0),
+        mask=selected_mask,
+    )
+    tl.store(node_mask_ptr + output_index, valid, mask=selected_mask)
+    tl.store(
+        draft_logprobs_ptr + output_index,
+        tl.where(valid, logprob, -float("inf")),
+        mask=selected_mask,
+    )
+
+    scratch_index = batch * SCRATCH_WIDTH + selected_offset
+    tl.store(
+        selected_tokens_ptr + scratch_index,
+        tl.where(valid, token, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_depths_ptr + scratch_index,
+        tl.where(valid, depth, 0),
+        mask=selected_mask,
+    )
+    position = tl.minimum(depth, DEPTH - 1)
+    tl.store(
+        selected_position_ids_ptr + scratch_index,
+        tl.where(valid, position, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_candidate_rows_ptr + scratch_index,
+        tl.where(valid, batch * DEPTH + position, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_batch_indices_ptr + scratch_index,
+        batch,
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_scores_ptr + scratch_index,
+        tl.where(valid, score, -float("inf")),
+        mask=selected_mask,
+    )
+    tl.store(selected_active_ptr + scratch_index, valid, mask=selected_mask)
+    tl.store(
+        frontier_active_ptr + selected_index,
+        False,
+        mask=selected_mask,
+    )
+    tl.store(
+        frontier_scores_ptr + selected_index,
+        -float("inf"),
+        mask=selected_mask,
+    )
+
+    if WRITE_ANCESTORS:
+        ancestor_offsets = tl.arange(0, BLOCK_DEPTH)[None, :]
+        ancestor_mask = (ancestor_offsets < DEPTH) & selected_mask[:, None]
+        parent_safe = tl.minimum(tl.maximum(parent, 0), NUM_NODES - 1)[:, None]
+        ancestors = tl.load(
+            slot_ancestors_ptr
+            + (batch * NUM_NODES + parent_safe) * DEPTH
+            + ancestor_offsets,
+            mask=ancestor_mask & valid[:, None],
+            other=-1,
         )
         tl.store(
-            frontier_logprobs_ptr + out_index,
-            tl.where(child_valid, top_value - log_denom, -float("inf")),
+            selected_parent_ancestors_ptr
+            + scratch_index[:, None] * DEPTH
+            + ancestor_offsets,
+            ancestors,
+            mask=ancestor_mask,
         )
-        tl.store(frontier_active_ptr + out_index, child_valid)
-        scores = tl.where(offsets == top_index, -float("inf"), scores)
+
 
 @triton.jit
 def _weaver_indexed_attention_kernel(
@@ -483,18 +657,137 @@ def _tree_metadata_parent_chain_kernel(
 
 
 @triton.jit
+def _weaver_target_only_verify_kernel(
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    target_probs_ptr,
+    uniform_samples_ptr,
+    bonus_uniforms_ptr,
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    NUM_NODES: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    row_base = (batch * NUM_NODES).to(tl.int64)
+
+    current = tl.full((), 0, dtype=tl.int64)
+    target_row = row_base
+    last_accepted = tl.load(retrieve_index_ptr + row_base)
+    accepted = tl.full((), 0, dtype=tl.int32)
+    rejected_mass = tl.full((), 0.0, dtype=tl.float32)
+    coin = tl.load(uniform_samples_ptr + row_base)
+
+    tl.store(accept_index_ptr + row_base, last_accepted.to(tl.int32))
+    depth = tl.full((), 1, dtype=tl.int32)
+    done = tl.full((), False, dtype=tl.int1)
+    while (depth < NUM_NODES) & (~done):
+        child = tl.load(retrieve_next_token_ptr + row_base + current)
+        found = tl.full((), False, dtype=tl.int1)
+        while (child >= 0) & (~found):
+            child_token = tl.load(candidates_ptr + row_base + child)
+            child_prob = tl.load(
+                target_probs_ptr + target_row * VOCAB_SIZE + child_token
+            ).to(tl.float32)
+            rejected_mass += child_prob
+            found = coin <= rejected_mass
+
+            child_retrieve = tl.load(retrieve_index_ptr + row_base + child)
+            tl.store(
+                predicts_ptr + last_accepted,
+                child_token.to(tl.int32),
+                mask=found,
+            )
+            tl.store(
+                accept_index_ptr + row_base + accepted + 1,
+                child_retrieve.to(tl.int32),
+                mask=found,
+            )
+
+            # This row is private to verification and dead after this kernel.
+            # Removing rejected child mass in-place avoids a dense [B,T,V]
+            # draft-probability scratch tensor.
+            tl.store(
+                target_probs_ptr + target_row * VOCAB_SIZE + child_token,
+                0.0,
+                mask=~found,
+            )
+
+            accepted += found.to(tl.int32)
+            last_accepted = tl.where(found, child_retrieve, last_accepted)
+            current = tl.where(found, child, current)
+            target_row = tl.where(found, row_base + child, target_row)
+            coin = tl.where(
+                found,
+                tl.load(uniform_samples_ptr + row_base + child),
+                coin,
+            )
+            rejected_mass = tl.where(found, 0.0, rejected_mass)
+            child = tl.where(
+                found,
+                child,
+                tl.load(retrieve_next_sibling_ptr + row_base + child),
+            )
+
+        done = ~found
+        depth += 1
+
+    tl.store(accept_token_num_ptr + batch, accepted)
+
+    residual_mass = tl.maximum(1.0 - rejected_mass, 0.0)
+    threshold = tl.load(bonus_uniforms_ptr + batch) * residual_mass
+    sampled = tl.full((), VOCAB_SIZE, dtype=tl.int32)
+    last_positive = tl.full((), -1, dtype=tl.int32)
+    cumulative = tl.full((), 0.0, dtype=tl.float32)
+    vocab_block = tl.full((), 0, dtype=tl.int32)
+    num_vocab_blocks = tl.cdiv(VOCAB_SIZE, BLOCK_V)
+    while (vocab_block < num_vocab_blocks) & (sampled == VOCAB_SIZE):
+        offsets = vocab_block * BLOCK_V + tl.arange(0, BLOCK_V)
+        mask = offsets < VOCAB_SIZE
+        probs = tl.load(
+            target_probs_ptr + target_row * VOCAB_SIZE + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        cdf = cumulative + tl.cumsum(probs, axis=0)
+        hits = mask & (probs > 0.0) & (cdf >= threshold)
+        sampled = tl.minimum(
+            sampled,
+            tl.min(tl.where(hits, offsets, VOCAB_SIZE), axis=0).to(tl.int32),
+        )
+        last_positive = tl.maximum(
+            last_positive,
+            tl.max(tl.where(mask & (probs > 0.0), offsets, -1), axis=0).to(
+                tl.int32
+            ),
+        )
+        cumulative += tl.sum(probs, axis=0)
+        vocab_block += 1
+
+    sampled = tl.where(sampled < VOCAB_SIZE, sampled, last_positive)
+    tl.store(predicts_ptr + last_accepted, sampled)
+
+
+@triton.jit
 def _weaver_traversal_verify_kernel(
     candidates_ptr,
     parent_indices_ptr,
     depths_ptr,
     node_mask_ptr,
     draft_logprobs_ptr,
+    sibling_keys_ptr,
     target_probs_ptr,
     uniform_samples_ptr,
     predicts_ptr,
     accept_index_ptr,
     accept_token_num_ptr,
     accept_leaf_ptr,
+    final_target_child_probs_ptr,
+    final_target_tail_scale_ptr,
     NUM_NODES: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -516,30 +809,81 @@ def _weaver_traversal_verify_kernel(
     )
 
     parents = tl.load(parent_indices_ptr + row_base + offsets, mask=col_mask, other=-1)
-    depths = tl.load(depths_ptr + row_base + offsets, mask=col_mask, other=0)
-    tokens = tl.load(candidates_ptr + row_base + offsets, mask=col_mask, other=0)
-    active = (tl.load(node_mask_ptr + row_base + offsets, mask=col_mask, other=0) != 0) & col_mask
+    original_active = (
+        tl.load(node_mask_ptr + row_base + offsets, mask=col_mask, other=0) != 0
+    ) & col_mask
+    active = original_active
     active = active | (offsets == 0)
+    original_active = original_active | (offsets == 0)
+    sibling_keys = tl.load(
+        sibling_keys_ptr + row_base + offsets,
+        mask=col_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
 
     local_logprobs = tl.load(
         draft_logprobs_ptr + row_base + offsets,
         mask=col_mask,
         other=-float("inf"),
     ).to(tl.float32)
-    local_weights = tl.where((offsets > 0) & active, tl.exp(local_logprobs), 0.0)
     draft_probs = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    target_child_probs = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     for node in tl.range(1, NUM_NODES, loop_unroll_factor=1):
         node_parent = tl.load(parent_indices_ptr + row_base + node)
-        node_weight = tl.load(draft_logprobs_ptr + row_base + node).to(tl.float32)
-        node_weight = tl.exp(node_weight)
+        node_token = tl.load(candidates_ptr + row_base + node)
+        node_token = tl.minimum(tl.maximum(node_token, 0), VOCAB_SIZE - 1)
+        node_logprob = tl.load(draft_logprobs_ptr + row_base + node).to(tl.float32)
+        sibling_max = tl.max(
+            tl.where(
+                (parents == node_parent) & active & (offsets > 0),
+                local_logprobs,
+                -float("inf"),
+            ),
+            axis=0,
+        )
+        node_weight = tl.exp(node_logprob - sibling_max)
         sibling_weight = tl.sum(
-            tl.where((parents == node_parent) & active & (offsets > 0), local_weights, 0.0),
+            tl.where(
+                (parents == node_parent) & active & (offsets > 0),
+                tl.exp(local_logprobs - sibling_max),
+                0.0,
+            ),
             axis=0,
         )
         node_prob = node_weight / tl.maximum(sibling_weight, 1.0e-20)
         node_is_active = (tl.load(node_mask_ptr + row_base + node) != 0) & (sibling_weight > 0.0)
         draft_probs = tl.where((offsets == node) & node_is_active, node_prob, draft_probs)
+        node_target_prob = tl.load(
+            target_probs_ptr + (row_base + node_parent) * VOCAB_SIZE + node_token,
+            mask=node_is_active,
+            other=0.0,
+        ).to(tl.float32)
+        target_child_probs = tl.where(
+            (offsets == node) & node_is_active,
+            node_target_prob,
+            target_child_probs,
+        )
+
+    target_outside_mass = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for parent in tl.range(0, NUM_NODES, loop_unroll_factor=1):
+        child_target_mass = tl.sum(
+            tl.where(
+                original_active & (offsets > 0) & (parents == parent),
+                target_child_probs,
+                0.0,
+            ),
+            axis=0,
+        )
+        target_outside_mass = tl.where(
+            offsets == parent,
+            tl.maximum(1.0 - child_target_mass, 0.0),
+            target_outside_mass,
+        )
+    # A residual update only subtracts mass at represented child tokens. Keep
+    # those values explicitly and represent every other vocabulary item as a
+    # shared scale times its original target probability.
+    target_tail_scale = tl.full((BLOCK_N,), 1.0, dtype=tl.float32)
 
     node_p = tl.where(offsets == 0, 1.0, 0.0).to(tl.float32)
     node_p_valid = offsets == 0
@@ -550,7 +894,6 @@ def _weaver_traversal_verify_kernel(
     while (verify_step < NUM_NODES) & (~done):
         cur = tl.full((), 0, dtype=tl.int64)
         cur_p = tl.full((), 1.0, dtype=tl.float32)
-        parent_for_leaf = tl.full((), 0, dtype=tl.int64)
         p_parent_for_leaf = tl.full((), 1.0, dtype=tl.float32)
         leaf = tl.full((), 0, dtype=tl.int64)
         leaf_p = tl.full((), 1.0, dtype=tl.float32)
@@ -558,20 +901,21 @@ def _weaver_traversal_verify_kernel(
 
         descend_step = tl.full((), 0, dtype=tl.int64)
         while (descend_step < NUM_NODES) & descending:
-            child_values = tl.where(active & (parents == cur), offsets, NUM_NODES)
+            child_mask = active & (parents == cur)
+            child_key = tl.max(
+                tl.where(child_mask, sibling_keys, -float("inf")), axis=0
+            )
+            child_values = tl.where(
+                child_mask & (sibling_keys == child_key), offsets, NUM_NODES
+            )
             child = tl.min(child_values, axis=0)
             has_child = child < NUM_NODES
             take_child = descending & has_child
             take_leaf = descending & (~has_child)
 
-            child_safe = tl.minimum(tl.maximum(child, 0), NUM_NODES - 1)
-            child_token = tl.load(candidates_ptr + row_base + child_safe)
-            child_token_safe = tl.minimum(tl.maximum(child_token, 0), VOCAB_SIZE - 1)
-            child_q = tl.load(
-                target_probs_ptr + (row_base + cur) * VOCAB_SIZE + child_token_safe,
-                mask=take_child,
-                other=0.0,
-            ).to(tl.float32)
+            child_q = tl.sum(
+                tl.where(offsets == child, target_child_probs, 0.0), axis=0
+            )
             child_s = tl.sum(tl.where(offsets == child, draft_probs, 0.0), axis=0)
             computed_child_p = tl.minimum(
                 cur_p * child_q / tl.maximum(child_s, 1.0e-20),
@@ -586,7 +930,6 @@ def _weaver_traversal_verify_kernel(
 
             leaf = tl.where(take_leaf, cur, leaf)
             leaf_p = tl.where(take_leaf, cur_p, leaf_p)
-            parent_for_leaf = tl.where(take_child, cur, parent_for_leaf)
             p_parent_for_leaf = tl.where(take_child, cur_p, p_parent_for_leaf)
             cur = tl.where(take_child, child, cur)
             cur_p = tl.where(take_child, next_child_p, cur_p)
@@ -602,21 +945,36 @@ def _weaver_traversal_verify_kernel(
         reject_parent = tl.load(parent_indices_ptr + row_base + leaf_safe, mask=reject_now, other=0)
         reject_parent = tl.minimum(tl.maximum(reject_parent, 0), NUM_NODES - 1)
 
-        child_mask = active & (parents == reject_parent)
-        child_tokens = tl.minimum(tl.maximum(tokens, 0), VOCAB_SIZE - 1)
-        q_children = tl.load(
-            target_probs_ptr + (row_base + reject_parent) * VOCAB_SIZE + child_tokens,
-            mask=child_mask & reject_now,
-            other=0.0,
-        ).to(tl.float32)
-        q_sum = tl.sum(tl.where(child_mask, q_children, 0.0), axis=0)
-        positive = tl.maximum(p_parent_for_leaf * q_children - draft_probs, 0.0)
-        positive_sum = tl.sum(tl.where(child_mask, positive, 0.0), axis=0)
-        target_tail = tl.maximum(p_parent_for_leaf * (1.0 - q_sum), 0.0)
-        residual_mass = positive_sum + target_tail
+        child_mask = original_active & (offsets > 0) & (parents == reject_parent)
+        target_tail = tl.sum(
+            tl.where(offsets == reject_parent, target_tail_scale, 0.0), axis=0
+        )
+        outside_mass = tl.sum(
+            tl.where(offsets == reject_parent, target_outside_mass, 0.0), axis=0
+        )
+        residual_children = tl.maximum(
+            p_parent_for_leaf * target_child_probs - draft_probs,
+            0.0,
+        )
+        residual_child_mass = tl.sum(
+            tl.where(child_mask, residual_children, 0.0), axis=0
+        )
+        residual_tail_scale = p_parent_for_leaf * target_tail
+        residual_mass = residual_child_mass + residual_tail_scale * outside_mass
         new_parent_p = residual_mass / tl.maximum(
             residual_mass + 1.0 - p_parent_for_leaf,
             1.0e-20,
+        )
+
+        target_child_probs = tl.where(
+            reject_now & child_mask,
+            residual_children / tl.maximum(residual_mass, 1.0e-20),
+            target_child_probs,
+        )
+        target_tail_scale = tl.where(
+            reject_now & (offsets == reject_parent),
+            residual_tail_scale / tl.maximum(residual_mass, 1.0e-20),
+            target_tail_scale,
         )
 
         rejected_s = tl.sum(tl.where(offsets == leaf, draft_probs, 0.0), axis=0)
@@ -635,6 +993,15 @@ def _weaver_traversal_verify_kernel(
 
     accept_leaf = tl.minimum(tl.maximum(accept_leaf, 0), NUM_NODES - 1)
     tl.store(accept_leaf_ptr + batch, accept_leaf)
+    tl.store(
+        final_target_child_probs_ptr + row_base + offsets,
+        target_child_probs,
+        mask=col_mask,
+    )
+    final_target_tail_scale = tl.sum(
+        tl.where(offsets == accept_leaf, target_tail_scale, 0.0), axis=0
+    )
+    tl.store(final_target_tail_scale_ptr + batch, final_target_tail_scale)
     leaf_depth = tl.load(depths_ptr + row_base + accept_leaf).to(tl.int32)
     tl.store(accept_token_num_ptr + batch, leaf_depth)
 
@@ -649,28 +1016,101 @@ def _weaver_traversal_verify_kernel(
             (row_base + chain_safe).to(tl.int32),
             mask=chain_valid & (chain_depth < NUM_NODES),
         )
-        parent = tl.load(parent_indices_ptr + row_base + chain_safe, mask=chain_valid, other=-1)
-        parent_safe = tl.minimum(tl.maximum(parent, 0), NUM_NODES - 1)
+        chain_parent = tl.load(
+            parent_indices_ptr + row_base + chain_safe, mask=chain_valid, other=-1
+        )
+        parent_safe = tl.minimum(tl.maximum(chain_parent, 0), NUM_NODES - 1)
         token = tl.load(candidates_ptr + row_base + chain_safe, mask=chain_valid, other=0)
         tl.store(
             predicts_ptr + row_base + parent_safe,
             token.to(tl.int32),
-            mask=chain_valid & (parent >= 0),
+            mask=chain_valid & (chain_parent >= 0),
         )
-        chain_node = tl.where(chain_valid, parent, chain_node)
+        chain_node = tl.where(chain_valid, chain_parent, chain_node)
         chain_step += 1
 
 
 @triton.jit
-def _weaver_current_cache_write_kernel(
+def _weaver_pack_verify_outputs_kernel(
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    out_tokens_ptr,
+    NUM_NODES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_N)
+    row_base = batch * NUM_NODES
+    commit_len = tl.load(accept_token_num_ptr + batch).to(tl.int32) + 1
+    valid = offsets < commit_len
+    accepted_index = tl.load(
+        accept_index_ptr + row_base + offsets,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    tokens = tl.load(
+        predicts_ptr + accepted_index,
+        mask=valid,
+        other=0,
+    )
+    tl.store(
+        out_tokens_ptr + row_base + offsets,
+        tokens.to(tl.int64),
+        mask=offsets < NUM_NODES,
+    )
+
+
+def _pack_verify_outputs(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack accepted verification outputs."""
+    if predicts.ndim != 1 or accept_index.ndim != 2 or num_correct.ndim != 1:
+        raise ValueError("invalid verification output ranks")
+    bs, num_nodes = accept_index.shape
+    if predicts.numel() != bs * num_nodes or num_correct.shape[0] != bs:
+        raise ValueError("verification output shapes do not agree")
+    if not predicts.is_cuda:
+        raise RuntimeError("verification output packing requires CUDA")
+
+    commit_lens = (num_correct.to(torch.int32) + 1).clamp_(max=num_nodes)
+    out_tokens = torch.empty(
+        (bs, num_nodes), dtype=torch.int64, device=predicts.device
+    )
+    block_n = triton.next_power_of_2(int(num_nodes))
+    _weaver_pack_verify_outputs_kernel[(bs,)](
+        predicts,
+        accept_index,
+        num_correct,
+        out_tokens,
+        NUM_NODES=int(num_nodes),
+        BLOCK_N=int(block_n),
+        num_warps=1,
+    )
+    return out_tokens, commit_lens
+
+
+@triton.jit
+def _weaver_publish_frontier_kernel(
     current_keys_ptr,
     current_values_ptr,
     node_keys_ptr,
     node_values_ptr,
     parent_ancestors_ptr,
     slot_ancestors_ptr,
+    logits_ptr,
+    candidate_ids_ptr,
+    prefix_score_ptr,
     valid_ptr,
     node_depth_ptr,
+    frontier_tokens_ptr,
+    frontier_parents_ptr,
+    frontier_depths_ptr,
+    frontier_scores_ptr,
+    frontier_logprobs_ptr,
+    frontier_active_ptr,
     slot_start,
     BS: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -681,9 +1121,14 @@ def _weaver_current_cache_write_kernel(
     HEAD_DIM: tl.constexpr,
     TOTAL_KV: tl.constexpr,
     TOTAL_ANCESTORS: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    EXPAND_WIDTH: tl.constexpr,
+    FRONTIER_SLOTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_POOL: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    program = tl.program_id(0)
+    offsets = program * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     kv_mask = offsets < TOTAL_KV
     hd = offsets % HEAD_DIM
     head = (offsets // HEAD_DIM) % NUM_HEADS
@@ -700,7 +1145,9 @@ def _weaver_current_cache_write_kernel(
         + hd)
     )
     key_value = tl.load(current_keys_ptr + current_index, mask=kv_mask & valid, other=0.0)
-    value_value = tl.load(current_values_ptr + current_index, mask=kv_mask & valid, other=0.0)
+    value_value = tl.load(
+        current_values_ptr + current_index, mask=kv_mask & valid, other=0.0
+    )
     tl.store(node_keys_ptr + node_index, key_value, mask=kv_mask)
     tl.store(node_values_ptr + node_index, value_value, mask=kv_mask)
 
@@ -710,12 +1157,7 @@ def _weaver_current_cache_write_kernel(
     ancestor_batch = (offsets // (DEPTH * WIDTH)) % BS
     ancestor_flat_row = ancestor_batch * WIDTH + ancestor_row
     ancestor_valid = (
-        tl.load(
-        valid_ptr + ancestor_flat_row,
-        mask=ancestor_mask,
-        other=0,
-        )
-        != 0
+        tl.load(valid_ptr + ancestor_flat_row, mask=ancestor_mask, other=0) != 0
     )
     current_pos = tl.load(
         node_depth_ptr + ancestor_flat_row,
@@ -729,6 +1171,74 @@ def _weaver_current_cache_write_kernel(
     ancestor_value = tl.where(ancestor_valid, ancestor_value, -1)
     out_index = (ancestor_batch * NUM_NODES + ancestor_slot) * DEPTH + ancestor_depth
     tl.store(slot_ancestors_ptr + out_index, ancestor_value, mask=ancestor_mask)
+
+    if program < BS * WIDTH:
+        candidate_offsets = tl.arange(0, BLOCK_POOL)
+        pool_mask = candidate_offsets < POOL_SIZE
+        candidate_base = program * POOL_SIZE + candidate_offsets
+        token_ids = tl.load(
+            candidate_ids_ptr + candidate_base, mask=pool_mask, other=-1
+        )
+        scores = tl.load(
+            logits_ptr + candidate_base,
+            mask=pool_mask,
+            other=-float("inf"),
+        ).to(tl.float32)
+        scores = tl.where((token_ids >= 0) & pool_mask, scores, -float("inf"))
+        parent_score = tl.load(prefix_score_ptr + program)
+        parent_depth = tl.load(node_depth_ptr + program)
+        parent_active = (tl.load(valid_ptr + program) != 0) & (parent_depth < DEPTH)
+        frontier_batch = program // WIDTH
+        frontier_row = program - frontier_batch * WIDTH
+        max_score = tl.max(scores, axis=0)
+        exp_scores = tl.where(
+            scores == -float("inf"), 0.0, tl.exp(scores - max_score)
+        )
+        log_denom = tl.log(tl.sum(exp_scores, axis=0)) + max_score
+        child_base = (
+            frontier_batch * FRONTIER_SLOTS
+            + (slot_start + frontier_row) * EXPAND_WIDTH
+        )
+        child_depth = parent_depth + 1
+        for child in tl.static_range(0, EXPAND_WIDTH):
+            top_value, top_index = tl.max(
+                scores,
+                axis=0,
+                return_indices=True,
+                return_indices_tie_break_left=True,
+            )
+            child_token = tl.load(candidate_ids_ptr + program * POOL_SIZE + top_index)
+            child_valid = (
+                parent_active & (child_token >= 0) & (top_value != -float("inf"))
+            )
+            child_index = child_base + child
+            tl.store(
+                frontier_tokens_ptr + child_index,
+                tl.where(child_valid, child_token, 0),
+            )
+            tl.store(
+                frontier_parents_ptr + child_index,
+                tl.where(child_valid, slot_start + frontier_row, 0),
+            )
+            tl.store(
+                frontier_depths_ptr + child_index,
+                tl.where(child_valid, child_depth, 0),
+            )
+            tl.store(
+                frontier_scores_ptr + child_index,
+                tl.where(
+                    child_valid,
+                    parent_score + top_value - log_denom,
+                    -float("inf"),
+                ),
+            )
+            tl.store(
+                frontier_logprobs_ptr + child_index,
+                tl.where(child_valid, top_value - log_denom, -float("inf")),
+            )
+            tl.store(frontier_active_ptr + child_index, child_valid)
+            scores = tl.where(candidate_offsets == top_index, -float("inf"), scores)
+
 
 def weaver_tree_batch_expand_width(tree_budget: Optional[int] = None) -> int:
     """Weaver expansion batch width: one Weaver call expands this many nodes.
@@ -932,6 +1442,7 @@ class DFlashTfmDraftInput(DFlashDraftInputV2):
         new_seq_lens: torch.Tensor,
         output_norm: torch.Tensor,
         committed_seq_lens_cpu: Optional[torch.Tensor] = None,
+        committed_seq_lens_ready: Optional[torch.cuda.Event] = None,
     ):
         bs = int(new_seq_lens.numel())
         device = bonus_tokens.device
@@ -944,6 +1455,17 @@ class DFlashTfmDraftInput(DFlashDraftInputV2):
         )
         self.output_norm = output_norm
         self.committed_seq_lens_cpu = committed_seq_lens_cpu
+        self.committed_seq_lens_ready = committed_seq_lens_ready
+
+    def _wait_committed_seq_lens_cpu(self) -> None:
+        ready = self.committed_seq_lens_ready
+        if ready is not None:
+            ready.synchronize()
+            self.committed_seq_lens_ready = None
+
+    def prepare_for_decode(self, batch: ScheduleBatch):
+        self._wait_committed_seq_lens_cpu()
+        return super().prepare_for_decode(batch)
 
     @classmethod
     def create_idle_input(
@@ -958,6 +1480,7 @@ class DFlashTfmDraftInput(DFlashDraftInputV2):
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        self._wait_committed_seq_lens_cpu()
         super().filter_batch(new_indices, has_been_filtered=has_been_filtered)
         self.output_norm = self.output_norm[new_indices]
         if self.committed_seq_lens_cpu is not None:
@@ -966,6 +1489,8 @@ class DFlashTfmDraftInput(DFlashDraftInputV2):
             ]
 
     def merge_batch(self, spec_info: "DFlashTfmDraftInput"):
+        self._wait_committed_seq_lens_cpu()
+        spec_info._wait_committed_seq_lens_cpu()
         super().merge_batch(spec_info)
         self.output_norm = torch.cat([self.output_norm, spec_info.output_norm], dim=0)
         if self.committed_seq_lens_cpu is not None:
@@ -992,19 +1517,67 @@ class WeaverRMSNorm(nn.Module):
 
 
 class WeaverBlock(nn.Module):
-    def __init__(self, d_rank: int, num_heads: int, mlp_dim: int):
+    def __init__(
+        self,
+        d_rank: int,
+        num_heads: int,
+        mlp_dim: int,
+        *,
+        rope_base: float = 10_000.0,
+    ):
         super().__init__()
         if d_rank % num_heads != 0:
             raise ValueError("d_rank must be divisible by num_heads")
         self.d_rank = int(d_rank)
         self.num_heads = int(num_heads)
         self.head_dim = int(d_rank // num_heads)
+        if self.head_dim % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension")
+        if rope_base <= 0:
+            raise ValueError("rope_base must be positive")
+        self.rope_base = float(rope_base)
         self.norm_attn = WeaverRMSNorm(d_rank)
         self.qkv_proj = nn.Linear(d_rank, 3 * d_rank, bias=False)
         self.o_proj = nn.Linear(d_rank, d_rank, bias=False)
         self.norm_mlp = WeaverRMSNorm(d_rank)
-        self.fc1 = nn.Linear(d_rank, mlp_dim)
-        self.fc2 = nn.Linear(mlp_dim, d_rank)
+        self.gate_up_proj = nn.Linear(d_rank, 2 * mlp_dim)
+        self.down_proj = nn.Linear(mlp_dim, d_rank)
+
+    def _apply_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half_dim = self.head_dim // 2
+        inv_freq = torch.arange(
+            0,
+            self.head_dim,
+            2,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        inv_freq = self.rope_base ** (-inv_freq / self.head_dim)
+        angles = positions.float()[..., None] * inv_freq
+        half_cos = angles.cos()
+        half_sin = angles.sin()
+        cos = torch.cat([half_cos, half_cos], dim=-1).unsqueeze(-2)
+        sin = torch.cat([half_sin, half_sin], dim=-1).unsqueeze(-2)
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            return torch.cat((-x[..., half_dim:], x[..., :half_dim]), dim=-1)
+
+        q_float = q.float()
+        k_float = k.float()
+        return (
+            (q_float * cos + rotate_half(q_float) * sin).to(q.dtype),
+            (k_float * cos + rotate_half(k_float) * sin).to(k.dtype),
+        )
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm_mlp(x)
+        gate, up = self.gate_up_proj(h).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
     def forward(
         self,
@@ -1020,6 +1593,8 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        positions = torch.arange(steps, dtype=torch.long, device=x.device)
+        q, k = self._apply_rope(q, k, positions[None])
         scale = self.head_dim**-0.5
         ext_scores = torch.einsum("rshd,rsphd->rhsp", q, external_keys) * scale
         tok_scores = torch.einsum("rshd,rthd->rhst", q, k) * scale
@@ -1033,7 +1608,7 @@ class WeaverBlock(nn.Module):
         )
         tok_y = torch.einsum("rhst,rthd->rshd", attn[:, :, :, prefix:], v)
         x = x + self.o_proj((ext_y + tok_y).reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
     def forward_indexed(
@@ -1057,6 +1632,7 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        q, k = self._apply_rope(q, k, position_ids[:, None] + 1)
         q = q.squeeze(1).contiguous()
         k = k.squeeze(1).contiguous()
         v = v.squeeze(1).contiguous()
@@ -1075,7 +1651,7 @@ class WeaverBlock(nn.Module):
             layer_index,
         )
         x = x + self.o_proj(y.reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
     def forward_chain(
@@ -1097,6 +1673,7 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        q, k = self._apply_rope(q, k, position_ids[:, None] + 1)
         q = q.squeeze(1).contiguous()
         k = k.squeeze(1).contiguous()
         v = v.squeeze(1).contiguous()
@@ -1113,7 +1690,7 @@ class WeaverBlock(nn.Module):
             layer_index,
         )
         x = x + self.o_proj(y.reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
 
@@ -1134,6 +1711,8 @@ class Weaver(nn.Module):
         candidate_pool_size: int,
         encoder_mode: int = ENCODER_GLOBAL_PROMPT,
         score_head: int = SCORE_SIMPLE,
+        activation: str = "swiglu",
+        rope_base: float = 10_000.0,
     ):
         super().__init__()
         if int(encoder_mode) != self.ENCODER_GLOBAL_PROMPT:
@@ -1144,6 +1723,10 @@ class Weaver(nn.Module):
             raise ValueError(
                 "DFlash+Weaver MVP supports score_head=simple_score only."
             )
+        if activation != "swiglu":
+            raise ValueError("DFlash+Weaver requires activation='swiglu'.")
+        if rope_base <= 0:
+            raise ValueError("DFlash+Weaver requires a positive rope_base.")
         self.d_model = int(d_model)
         self.d_embed = int(d_embed)
         self.d_rank = int(d_rank)
@@ -1152,39 +1735,25 @@ class Weaver(nn.Module):
         self.mlp_dim = int(mlp_dim)
         self.K = int(K)
         self.candidate_pool_size = int(candidate_pool_size)
+        self.activation = "swiglu"
+        self.rope_base = float(rope_base)
         self.output_norm = WeaverRMSNorm(d_model)
         self.embed_norm = WeaverRMSNorm(d_embed)
         self.token_in = nn.Linear(d_embed, d_rank)
         self.proposal_in = nn.Linear(d_model, d_rank)
         self.blocks = nn.ModuleList(
-            [WeaverBlock(d_rank, num_heads, mlp_dim) for _ in range(num_layers)]
+            [
+                WeaverBlock(
+                    d_rank,
+                    num_heads,
+                    mlp_dim,
+                    rope_base=self.rope_base,
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.out_norm = WeaverRMSNorm(d_rank)
         self.lm_head_query_in = nn.Linear(d_rank, d_model, bias=False)
-        self.pos_emb = nn.Parameter(torch.zeros(K, d_rank))
-
-    @staticmethod
-    def _migrate_state_dict(
-        state_dict: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        migrated = dict(state_dict)
-        q_suffix = "q_proj.weight"
-        prefixes = [
-            key[: -len(q_suffix)] for key in migrated.keys() if key.endswith(q_suffix)
-        ]
-        for prefix in prefixes:
-            q_key = f"{prefix}q_proj.weight"
-            k_key = f"{prefix}k_proj.weight"
-            v_key = f"{prefix}v_proj.weight"
-            qkv_key = f"{prefix}qkv_proj.weight"
-            if qkv_key not in migrated:
-                migrated[qkv_key] = torch.cat(
-                    [migrated[q_key], migrated[k_key], migrated[v_key]], dim=0
-                )
-            migrated.pop(q_key, None)
-            migrated.pop(k_key, None)
-            migrated.pop(v_key, None)
-        return migrated
 
     @classmethod
     def load(
@@ -1202,9 +1771,7 @@ class Weaver(nn.Module):
                 "JAX/Equinox conversion is intentionally a separate final step."
             )
         model = cls(**payload["config"]).to(device=device, dtype=dtype)
-        model.load_state_dict(
-            cls._migrate_state_dict(payload["state_dict"]), strict=True
-        )
+        model.load_state_dict(payload["state_dict"], strict=True)
         model.eval()
         return model
 
@@ -1221,7 +1788,7 @@ class Weaver(nn.Module):
         output_norm_features: torch.Tensor,
         proposal_features: torch.Tensor,
     ) -> torch.Tensor:
-        rows, steps, _ = proposal_features.shape
+        rows, _, _ = proposal_features.shape
         first_output = self.output_norm(output_norm_features[:, :1].float()).to(
             dtype=proposal_features.dtype
         )
@@ -1230,16 +1797,12 @@ class Weaver(nn.Module):
             dtype=proposal_features.dtype
         )
         proposal_tokens = self.proposal_in(proposal)
-        proposal_tokens = (
-            proposal_tokens + self.pos_emb[:steps].to(dtype=proposal_tokens.dtype)[None]
-        )
         return torch.cat([output_token, proposal_tokens], dim=1)
 
     def prompt_external_kv(
         self,
         output_norm_features: torch.Tensor,
         proposal_features: torch.Tensor,
-        steps: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self._prompt_tokens(output_norm_features, proposal_features)
         rows, prefix, _ = x.shape
@@ -1292,11 +1855,6 @@ class Weaver(nn.Module):
         depth = parent_ancestors.shape[1]
         x = self._token_project(token_ids[:, None], token_embed)
         position_ids = position_ids.clamp(min=0, max=depth - 1)
-        pos_emb_ids = position_ids.clamp(max=self.K - 1)
-        pos_emb = torch.index_select(self.pos_emb, 0, pos_emb_ids.reshape(-1)).view(
-            pos_emb_ids.shape[0], self.d_rank
-        )
-        x = x + pos_emb[:, None].to(dtype=x.dtype)
         current_key_layers = []
         current_value_layers = []
         for layer_index, block in enumerate(self.blocks):
@@ -1340,11 +1898,6 @@ class Weaver(nn.Module):
         depth = chain_keys.shape[1]
         x = self._token_project(token_ids[:, None], token_embed)
         position_ids = position_ids.clamp(min=0, max=depth - 1)
-        pos_emb_ids = position_ids.clamp(max=self.K - 1)
-        pos_emb = torch.index_select(self.pos_emb, 0, pos_emb_ids.reshape(-1)).view(
-            pos_emb_ids.shape[0], self.d_rank
-        )
-        x = x + pos_emb[:, None].to(dtype=x.dtype)
         current_key_layers = []
         current_value_layers = []
         for layer_index, block in enumerate(self.blocks):
@@ -1476,6 +2029,67 @@ def build_tree_metadata(
     )
 
 
+def _tree_sampling_uniforms(
+    *,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    count: int,
+) -> torch.Tensor:
+    if sampling_seed is None:
+        uniforms = torch.rand(
+            (positions.shape[0], count), dtype=torch.float32, device=positions.device
+        )
+    else:
+        from sglang.srt.layers.utils.hash import murmur_hash32
+
+        streams = torch.arange(count, dtype=torch.long, device=positions.device)
+        uniforms = murmur_hash32(
+            sampling_seed.to(torch.long), positions.to(torch.long), streams
+        ).to(torch.float32)
+        uniforms *= 1.0 / 4294967296.0
+    return uniforms.clamp_(
+        min=torch.finfo(torch.float32).tiny,
+        max=1.0 - torch.finfo(torch.float32).eps,
+    )
+
+
+def _filter_tree_target_probs(
+    probs: torch.Tensor,
+    *,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_k: bool,
+    need_top_p: bool,
+    sequential: bool,
+) -> torch.Tensor:
+    # The normal flashinfer min-p path applies top-k then top-p. Every other
+    # backend uses joint filtering, whose support is top-p then top-k.
+    filters = (
+        (("top_k", need_top_k), ("top_p", need_top_p))
+        if sequential
+        else (("top_p", need_top_p), ("top_k", need_top_k))
+    )
+    for filter_name, enabled in filters:
+        if not enabled:
+            continue
+        if filter_name == "top_k":
+            probs = top_k_renorm_prob(probs, top_ks)
+        else:
+            probs = top_p_renorm_prob(probs, top_ps)
+
+    thresholds = probs.amax(dim=-1, keepdim=True) * min_ps[:, None]
+    probs = torch.where(probs >= thresholds, probs, 0.0)
+    return probs / probs.sum(dim=-1, keepdim=True)
+
+
+def _sample_prob_rows(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
+    assert probs.ndim == 2
+    assert uniforms.shape == (probs.shape[0],)
+    cdf = torch.cumsum(probs, dim=-1)
+    return torch.sum(cdf < uniforms[:, None], dim=-1).clamp_max(probs.shape[-1] - 1)
+
+
 def _traversal_verify_target_probs(
     *,
     candidates: torch.Tensor,
@@ -1484,7 +2098,9 @@ def _traversal_verify_target_probs(
     node_mask: torch.Tensor,
     draft_logprobs: torch.Tensor,
     target_probs: torch.Tensor,
+    sibling_keys: torch.Tensor,
     uniform_samples: torch.Tensor,
+    bonus_uniforms: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not candidates.is_cuda:
         raise RuntimeError("DFLASH_TFM traversal verification requires CUDA.")
@@ -1498,16 +2114,35 @@ def _traversal_verify_target_probs(
             "target_probs shape must start with candidates.shape, "
             f"got target_probs={tuple(target_probs.shape)}, candidates={tuple(candidates.shape)}."
         )
-    target_probs = target_probs.contiguous()
+    target_probs = target_probs.to(torch.float32).contiguous()
+    target_probs /= target_probs.sum(dim=-1, keepdim=True)
     parent_indices = parent_indices.to(device=candidates.device, dtype=torch.int64)
     depths = depths.to(device=candidates.device, dtype=torch.int64)
     node_mask = node_mask.to(device=candidates.device, dtype=torch.bool)
     draft_logprobs = draft_logprobs.to(device=candidates.device, dtype=torch.float32)
-    uniform_samples = uniform_samples.to(device=candidates.device, dtype=torch.float32)
+    sibling_keys = sibling_keys.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    uniform_samples = uniform_samples.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    bonus_uniforms = bonus_uniforms.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    if sibling_keys.shape != (bs, num_nodes):
+        raise RuntimeError(
+            "sibling_keys shape mismatch for traversal verification: "
+            f"expected {(bs, num_nodes)}, got {tuple(sibling_keys.shape)}."
+        )
     if uniform_samples.shape != (bs, num_nodes):
         raise RuntimeError(
             "uniform_samples shape mismatch for traversal verification: "
             f"expected {(bs, num_nodes)}, got {tuple(uniform_samples.shape)}."
+        )
+    if bonus_uniforms.shape != (bs,):
+        raise RuntimeError(
+            "bonus_uniforms shape mismatch for traversal verification: "
+            f"expected {(bs,)}, got {tuple(bonus_uniforms.shape)}."
         )
 
     predict = torch.empty((bs * num_nodes,), dtype=torch.int32, device=candidates.device)
@@ -1516,6 +2151,12 @@ def _traversal_verify_target_probs(
     )
     num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
     accept_leaf = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    final_target_child_probs = torch.empty(
+        (bs, num_nodes), dtype=torch.float32, device=candidates.device
+    )
+    final_target_tail_scale = torch.empty(
+        (bs,), dtype=torch.float32, device=candidates.device
+    )
     block_n = triton.next_power_of_2(int(num_nodes))
     _weaver_traversal_verify_kernel[(int(bs),)](
         candidates.to(torch.int64),
@@ -1523,21 +2164,90 @@ def _traversal_verify_target_probs(
         depths,
         node_mask,
         draft_logprobs,
+        sibling_keys,
         target_probs,
         uniform_samples,
         predict,
         accept_index,
         num_correct,
         accept_leaf,
+        final_target_child_probs,
+        final_target_tail_scale,
         NUM_NODES=int(num_nodes),
         VOCAB_SIZE=int(target_probs.shape[-1]),
         BLOCK_N=int(block_n),
         num_warps=8,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=candidates.device)
-    bonus = torch.multinomial(target_probs[row_ids, accept_leaf], 1).squeeze(1)
+    bonus_probs = (
+        target_probs[row_ids, accept_leaf] * final_target_tail_scale[:, None]
+    )
+    child_mask = node_mask & (parent_indices == accept_leaf[:, None])
+    vocab_size = int(bonus_probs.shape[-1])
+    child_token_ids = torch.where(
+        child_mask,
+        candidates,
+        torch.full_like(candidates, vocab_size),
+    ).to(torch.long)
+    child_values = torch.where(
+        child_mask,
+        final_target_child_probs,
+        torch.zeros_like(final_target_child_probs),
+    )
+    bonus_probs = torch.nn.functional.pad(bonus_probs, (0, 1))
+    bonus_probs.scatter_(1, child_token_ids, child_values)
+    bonus_probs = bonus_probs[:, :vocab_size]
+    bonus_probs /= bonus_probs.sum(dim=-1, keepdim=True)
+    bonus_cdf = torch.cumsum(bonus_probs, dim=-1)
+    bonus = torch.sum(bonus_cdf < bonus_uniforms[:, None], dim=-1).clamp_max(
+        bonus_probs.shape[-1] - 1
+    )
     predict[row_ids * num_nodes + accept_leaf] = bonus.to(torch.int32)
     return predict, accept_index, num_correct, accept_leaf
+
+
+def _target_only_verify_target_probs(
+    *,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    bonus_uniforms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, num_nodes = candidates.shape
+    target_probs = target_probs.to(torch.float32).contiguous()
+    uniform_samples = uniform_samples.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    bonus_uniforms = bonus_uniforms.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    predict = torch.full(
+        (bs * num_nodes,), -1, dtype=torch.int32, device=candidates.device
+    )
+    accept_index = torch.full(
+        (bs, num_nodes), -1, dtype=torch.int32, device=candidates.device
+    )
+    num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
+    _weaver_target_only_verify_kernel[(int(bs),)](
+        candidates.to(torch.int64),
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_probs,
+        uniform_samples,
+        bonus_uniforms,
+        predict,
+        accept_index,
+        num_correct,
+        NUM_NODES=int(num_nodes),
+        VOCAB_SIZE=int(target_probs.shape[-1]),
+        BLOCK_V=4096,
+        num_warps=8,
+    )
+    return predict, accept_index, num_correct
 
 
 class DFlashTfmVerifyInput(DFlashVerifyInput):
@@ -1556,6 +2266,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         parent_indices: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
         draft_logprobs: Optional[torch.Tensor] = None,
+        tree_sampling_mode: str,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         super().__init__(
@@ -1579,6 +2290,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         self.parent_indices = parent_indices
         self.node_mask = node_mask
         self.draft_logprobs = draft_logprobs
+        if tree_sampling_mode not in ("target_only", "traversal"):
+            raise ValueError(f"Unknown DFLASH_TFM tree sampling mode: {tree_sampling_mode!r}")
+        self.tree_sampling_mode = tree_sampling_mode
         # Tree-local slot of each request's last accepted node; populated by
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
@@ -1726,27 +2440,80 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                 "DFLASH_TFM traversal verification requires tree parents, "
                 "node mask, and draft log-probabilities."
             )
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        if penalizer is not None and penalizer.is_required:
+            raise RuntimeError(
+                "Lossless DFLASH_TFM tree sampling does not yet support "
+                "frequency, presence, or repetition penalties because they must "
+                "evolve independently along every tree path."
+            )
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, self.draft_token_num, dim=0
         )
         target_probs = F.softmax(
-            logits_output.next_token_logits / expanded_temperature, dim=-1
+            (logits_output.next_token_logits / expanded_temperature).float(), dim=-1
         )
-        if getattr(sampling_info, "need_top_k_sampling", True):
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+        top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, self.draft_token_num, dim=0
+        )
+        top_ps = torch.repeat_interleave(
+            sampling_info.top_ps, self.draft_token_num, dim=0
+        )
+        min_ps = torch.repeat_interleave(
+            sampling_info.min_ps, self.draft_token_num, dim=0
+        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        sequential_filters = (
+            server_args.sampling_backend == "flashinfer"
+            and sampling_info.need_min_p_sampling
+        )
+        target_probs = _filter_tree_target_probs(
+            target_probs,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            min_ps=min_ps,
+            need_top_k=sampling_info.need_top_k_sampling,
+            need_top_p=sampling_info.need_top_p_sampling,
+            sequential=sequential_filters,
+        )
         target_probs = target_probs.view(bs, self.draft_token_num, -1)
+        random_count = (
+            self.draft_token_num + 1
+            if self.tree_sampling_mode == "target_only"
+            else 2 * self.draft_token_num + 1
+        )
+        random_values = _tree_sampling_uniforms(
+            sampling_seed=sampling_info.sampling_seed,
+            positions=batch.seq_lens,
+            count=random_count,
+        )
+        if self.tree_sampling_mode == "target_only":
+            target_uniforms = random_values[:, : self.draft_token_num].contiguous()
+            if torch.version.hip is not None:
+                target_predict = _sample_prob_rows(
+                    target_probs.flatten(0, 1), target_uniforms.flatten()
+                ).view(bs, self.draft_token_num)
+                return self._verify_from_target_predict(target_predict, bs)
+            return _target_only_verify_target_probs(
+                candidates=candidates,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
+                target_probs=target_probs,
+                uniform_samples=target_uniforms,
+                bonus_uniforms=random_values[:, -1],
+            )
+        if self.tree_sampling_mode != "traversal":
+            raise ValueError(
+                f"Unknown DFLASH_TFM tree sampling mode: {self.tree_sampling_mode!r}"
+            )
+        # q_T is proportional to exp(draft_logprob) over the final retained
+        # siblings and zero elsewhere. Gumbel sorting samples q_T's
+        # Plackett-Luce order without replacement.
+        sibling_uniforms = random_values[:, : self.draft_token_num].contiguous()
+        sibling_keys = self.draft_logprobs - torch.log(-torch.log(sibling_uniforms))
         predict, accept_index, num_correct, _ = _traversal_verify_target_probs(
             candidates=candidates.to(torch.int64),
             parent_indices=self.parent_indices,
@@ -1754,7 +2521,11 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             node_mask=self.node_mask,
             draft_logprobs=self.draft_logprobs,
             target_probs=target_probs,
-            uniform_samples=torch.rand_like(candidates, dtype=torch.float32),
+            sibling_keys=sibling_keys,
+            uniform_samples=random_values[
+                :, self.draft_token_num : 2 * self.draft_token_num
+            ].contiguous(),
+            bonus_uniforms=random_values[:, -1],
         )
         return predict, accept_index, num_correct
 
@@ -1800,127 +2571,61 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                 batch, logits_output, sampling_info
             )
 
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
-        commit_lens_cpu: List[int] = []
-        num_correct_cpu: List[int] = []
-        out_tokens_cpu: List[List[int]] = []
-        for row in accept_index_cpu:
-            row_tokens: List[int] = []
-            for idx in row:
-                if idx == -1:
-                    break
-                row_tokens.append(int(predict_cpu[int(idx)]))
-            if not row_tokens:
-                raise RuntimeError(
-                    "DFlash+Weaver verify produced an empty accept path."
-                )
-            commit_lens_cpu.append(len(row_tokens))
-            num_correct_cpu.append(max(0, len(row_tokens) - 1))
-            out_tokens_cpu.append(row_tokens)
-
-        commit_lens = torch.tensor(
-            commit_lens_cpu, dtype=torch.int32, device=batch.device
+        out_tokens, commit_lens = _pack_verify_outputs(
+            predict, accept_index, num_correct
         )
         row_ids = torch.arange(bs, device=batch.device, dtype=torch.long)
         self.accept_leaf_slots = (
             accept_index[row_ids, commit_lens.to(torch.long) - 1].to(torch.long)
             - row_ids * self.draft_token_num
         )
-        out_tokens = torch.zeros(
-            (bs, self.draft_token_num), dtype=torch.int64, device=batch.device
-        )
-        for i, row_tokens in enumerate(out_tokens_cpu):
-            out_tokens[i, : len(row_tokens)] = torch.tensor(
-                row_tokens, dtype=torch.int64, device=batch.device
-            )
 
         out_cache_loc = batch.out_cache_loc
         out_cache_loc_2d = out_cache_loc.view(bs, self.draft_token_num)
-        if bs == 1:
-            flat_accept = accept_index[0, : commit_lens_cpu[0]].to(torch.long)
-        else:
-            flat_accept = torch.cat(
-                [
-                    accept_index[i, :commit_len]
-                    for i, commit_len in enumerate(commit_lens_cpu)
-                ]
-            ).to(torch.long)
-
+        accepted_node_indices = accept_index.clamp_min(0).to(torch.long)
+        accepted_cache_loc_2d = out_cache_loc[accepted_node_indices].view(
+            bs, self.draft_token_num
+        )
         if page_size > 1:
             if token_to_kv_pool_allocator is None:
                 raise RuntimeError(
                     "DFLASH_TFM page_size>1 commit requires target KV cache access."
                 )
-            dst_parts = []
-            for i, commit_len in enumerate(commit_lens_cpu):
-                if commit_len > 0:
-                    dst_parts.append(out_cache_loc_2d[i, :commit_len])
-                if commit_len < self.draft_token_num:
-                    req_idx = batch.req_pool_indices[i].to(torch.long)
-                    seq_len = int(batch.seq_lens_cpu[i].item())
-                    batch.req_to_token_pool.req_to_token[
-                        req_idx,
-                        seq_len + commit_len : seq_len + self.draft_token_num,
-                    ] = out_cache_loc_2d[i, commit_len : self.draft_token_num]
-            compact_cache_loc = (
-                torch.cat(dst_parts) if dst_parts else out_cache_loc.new_empty((0,))
+            token_to_kv_pool_allocator.get_kvcache().move_kv_cache_prefix_valid(
+                out_cache_loc_2d,
+                accepted_cache_loc_2d,
+                commit_lens,
             )
-            accept_cache_loc = out_cache_loc[flat_accept]
-            token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                compact_cache_loc, accept_cache_loc
-            )
-            batch.out_cache_loc = compact_cache_loc
-
+            committed_cache_loc_2d = out_cache_loc_2d
         else:
-            for i, row in enumerate(accept_index_cpu):
-                accept_local = {
-                    int(idx) - i * self.draft_token_num for idx in row if idx != -1
-                }
-                commit_len = commit_lens_cpu[i]
-                if commit_len >= self.draft_token_num:
-                    continue
-                remaining_local = [
-                    j
-                    for j in range(self.draft_token_num)
-                    if j not in accept_local
-                ]
-                req_idx = batch.req_pool_indices[i].to(torch.long)
-                seq_len = int(batch.seq_lens_cpu[i].item())
-                remaining_slots = out_cache_loc[
-                    i * self.draft_token_num
-                    + torch.tensor(
-                        remaining_local, dtype=torch.long, device=batch.device
-                    )
-                ]
-                batch.req_to_token_pool.req_to_token[
-                    req_idx,
-                    seq_len + commit_len : seq_len + self.draft_token_num,
-                ] = remaining_slots
-            batch.out_cache_loc = out_cache_loc[flat_accept]
-
-        assign_req_to_token_pool_func(
+            committed_cache_loc_2d = accepted_cache_loc_2d
+        num_tokens = int(committed_cache_loc_2d.shape[1])
+        assign_req_to_token_pool_dflash_dense[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + commit_lens.to(batch.seq_lens.dtype),
-            batch.out_cache_loc,
-            bs,
+            commit_lens,
+            committed_cache_loc_2d,
+            out_cache_loc_2d,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            num_tokens,
+            triton.next_power_of_2(num_tokens),
         )
+        batch.out_cache_loc = committed_cache_loc_2d.reshape(-1)
         batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-        batch.seq_lens_cpu.add_(
-            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
-        )
-        batch.seq_lens_sum += sum(commit_lens_cpu)
 
         split = split_dflash_tfm_hidden(
             logits_output.hidden_states, hidden_size
         )
-        target_hidden = split.target_hidden[flat_accept]
-        target_positions = self.positions[flat_accept]
-        output_norm = split.output_norm[flat_accept]
-        terminal_offsets = torch.cumsum(commit_lens.to(torch.long), dim=0) - 1
-        next_output_norm = output_norm[terminal_offsets]
+        target_hidden = split.target_hidden[accepted_node_indices].reshape(
+            -1, split.target_hidden.shape[-1]
+        )
+        target_positions = self.positions[accepted_node_indices].reshape(-1)
+        output_norm = split.output_norm[accepted_node_indices]
+        terminal_offsets = commit_lens.to(torch.long) - 1
+        next_output_norm = output_norm[
+            torch.arange(bs, device=batch.device), terminal_offsets
+        ]
         logits_output.hidden_states = None
         return (
             out_tokens,
@@ -1928,11 +2633,16 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             target_hidden,
             target_positions,
             next_output_norm,
-            num_correct_cpu,
+            None,
         )
 
 
 class DFlashTfmWorker(DFlashWorkerV2):
+    def _maybe_build_draft_sampler(self):
+        # Weaver selects a top-k candidate pool from the draft hidden states.
+        # The inherited greedy sampler computes a second, unused LM-head pass.
+        return None
+
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
     ) -> None:
@@ -1976,6 +2686,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             dtype=dtype,
         )
         self.tree_budget = int(self.server_args.speculative_dflash_tfm_tree_budget or 128)
+        self.tree_sampling_mode = (
+            self.server_args.speculative_dflash_tfm_tree_sampling_mode
+        )
         requested_pool_size = int(
             self.server_args.speculative_dflash_tfm_candidate_pool_size
             or self.weaver.candidate_pool_size
@@ -2007,6 +2720,47 @@ class DFlashTfmWorker(DFlashWorkerV2):
             self.server_args.speculative_num_draft_tokens or self.block_size
         )
         self.use_chain_verify = self.target_verify_tokens <= int(self.block_size)
+        self._committed_seq_lens_d2h_stream = (
+            torch.cuda.Stream(device=self.device) if is_cuda() else None
+        )
+        self._committed_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+        self._committed_seq_lens_cpu_dtype: Optional[torch.dtype] = None
+        self._committed_seq_lens_ready = (
+            torch.cuda.Event() if self._committed_seq_lens_d2h_stream is not None else None
+        )
+
+    def _async_committed_seq_lens_cpu(
+        self, seq_lens: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, Optional[torch.cuda.Event]]:
+        """Copy committed lengths asynchronously for the next draft step."""
+        if self._committed_seq_lens_d2h_stream is None or not seq_lens.is_cuda:
+            return seq_lens.to(device="cpu", dtype=dtype), None
+
+        try:
+            if (
+                self._committed_seq_lens_cpu_buf is None
+                or self._committed_seq_lens_cpu_buf.numel() < seq_lens.numel()
+                or self._committed_seq_lens_cpu_dtype != dtype
+            ):
+                self._committed_seq_lens_cpu_buf = torch.empty(
+                    (max(32, int(seq_lens.numel())),),
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._committed_seq_lens_cpu_dtype = dtype
+            seq_lens_cpu = self._committed_seq_lens_cpu_buf[: seq_lens.numel()]
+            forward_stream = torch.cuda.current_stream(seq_lens.device)
+            d2h_stream = self._committed_seq_lens_d2h_stream
+            d2h_stream.wait_stream(forward_stream)
+            with torch.cuda.stream(d2h_stream):
+                seq_lens_cpu.copy_(seq_lens, non_blocking=True)
+                assert self._committed_seq_lens_ready is not None
+                self._committed_seq_lens_ready.record(d2h_stream)
+            seq_lens.record_stream(d2h_stream)
+            return seq_lens_cpu, self._committed_seq_lens_ready
+        except RuntimeError:
+            return seq_lens.to(device="cpu", dtype=dtype), None
 
     def init_attention_backends(self):
         if self.target_verify_tokens <= int(self.block_size):
@@ -2151,6 +2905,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_ids: torch.Tensor,
         candidate_weights: torch.Tensor,
         candidate_scores: torch.Tensor,
+        candidate_row_index: torch.Tensor,
         external_keys: torch.Tensor,
         external_values: torch.Tensor,
         external_mask: torch.Tensor,
@@ -2160,7 +2915,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         parent_ancestors: torch.Tensor,
         row_batch_indices: torch.Tensor,
         token_embed: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         key = (
             tuple(token_ids.shape),
             token_ids.dtype,
@@ -2170,6 +2925,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_weights.dtype,
             tuple(candidate_scores.shape),
             candidate_scores.dtype,
+            tuple(candidate_row_index.shape),
+            candidate_row_index.dtype,
             tuple(external_keys.shape),
             external_keys.dtype,
             tuple(external_values.shape),
@@ -2201,6 +2958,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 candidate_ids,
                 candidate_weights,
                 candidate_scores,
+                candidate_row_index,
                 external_keys,
                 external_values,
                 external_mask,
@@ -2211,7 +2969,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 row_batch_indices,
                 token_embed,
             ):
-                return self.weaver.step_indexed(
+                candidate_ids = candidate_ids[candidate_row_index]
+                candidate_weights = candidate_weights[candidate_row_index]
+                candidate_scores = candidate_scores[candidate_row_index]
+                outputs = self.weaver.step_indexed(
                     token_ids=token_ids,
                     candidate_ids=candidate_ids,
                     candidate_weights=candidate_weights,
@@ -2226,6 +2987,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     row_batch_indices=row_batch_indices,
                     token_embed=token_embed,
                 )
+                return (*outputs, candidate_ids)
 
             compiled_step = torch.compile(
                 step_fn,
@@ -2242,6 +3004,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_ids,
             candidate_weights,
             candidate_scores,
+            candidate_row_index,
             external_keys,
             external_values,
             external_mask,
@@ -2368,7 +3131,6 @@ class DFlashTfmWorker(DFlashWorkerV2):
         node_budget = int(self.tree_budget)
         num_nodes = node_budget + 1
         device = root_ids.device
-        node_indices = torch.arange(num_nodes, dtype=torch.long, device=device)
         tokens = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
         parents = torch.full((bs, num_nodes), -1, dtype=torch.long, device=device)
         depths = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
@@ -2391,7 +3153,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
         batch_expand_width = min(
             weaver_tree_batch_expand_width(node_budget), node_budget
         )
-
+        if batch_expand_width > 32:
+            raise RuntimeError(
+                "Fused Weaver frontier materialization supports at most "
+                f"32 selected nodes per expansion, got {batch_expand_width}."
+            )
         external_keys, external_values, external_mask = (
             self.weaver.prompt_external_kv(output_norm[:, None], proposal_features)
         )
@@ -2400,30 +3166,49 @@ class DFlashTfmWorker(DFlashWorkerV2):
             bs * depth, pool_size, candidate_weights.shape[-1]
         )
         candidate_scores_rows = candidate_scores.reshape(bs * depth, pool_size)
-        node_keys = torch.zeros(
+        node_keys = torch.empty(
             (bs, num_nodes, num_layers, num_heads, head_dim),
             dtype=proposal_features.dtype,
             device=device,
         )
-        node_values = torch.zeros_like(node_keys)
-        slot_ancestors = torch.full(
-            (bs, num_nodes, depth), -1, dtype=torch.long, device=device
+        node_values = torch.empty_like(node_keys)
+        slot_ancestors = torch.empty(
+            (bs, num_nodes, depth), dtype=torch.long, device=device
         )
-        slot_ancestors[:, 0, 0] = 0
 
-        frontier_tokens = torch.zeros((bs, frontier_slots), dtype=torch.long, device=device)
-        frontier_parents = torch.zeros(
+        frontier_tokens = torch.empty(
             (bs, frontier_slots), dtype=torch.long, device=device
         )
-        frontier_depths = torch.zeros(
-            (bs, frontier_slots), dtype=torch.long, device=device
+        frontier_parents = torch.empty_like(frontier_tokens)
+        frontier_depths = torch.empty_like(frontier_tokens)
+        frontier_scores = torch.empty(
+            (bs, frontier_slots), dtype=torch.float32, device=device
         )
-        frontier_scores = torch.full(
-            (bs, frontier_slots), -torch.inf, dtype=torch.float32, device=device
-        )
-        frontier_logprobs = torch.full_like(frontier_scores, -torch.inf)
-        frontier_active = torch.zeros(
+        frontier_logprobs = torch.empty_like(frontier_scores)
+        frontier_active = torch.empty(
             (bs, frontier_slots), dtype=torch.bool, device=device
+        )
+        if batch_expand_width > expand_width:
+            padding = slice(expand_width, batch_expand_width)
+            frontier_scores[:, padding].fill_(-torch.inf)
+            frontier_active[:, padding].zero_()
+        selected_tokens = torch.empty(
+            (bs, batch_expand_width), dtype=torch.long, device=device
+        )
+        selected_depths = torch.empty_like(selected_tokens)
+        selected_position_ids = torch.empty_like(selected_tokens)
+        selected_candidate_rows = torch.empty_like(selected_tokens)
+        selected_batch_indices = torch.empty_like(selected_tokens)
+        selected_scores = torch.empty(
+            (bs, batch_expand_width), dtype=torch.float32, device=device
+        )
+        selected_active = torch.empty(
+            (bs, batch_expand_width), dtype=torch.bool, device=device
+        )
+        selected_parent_ancestors = torch.empty(
+            (bs, batch_expand_width, depth),
+            dtype=torch.long,
+            device=device,
         )
         if device.type != "cuda" or expand_width != 8:
             raise RuntimeError(
@@ -2431,41 +3216,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 "expand_width=8."
             )
 
-        def write_candidate_frontier(
+        def publish_frontier(
             logits: torch.Tensor,
             row_candidate_ids: torch.Tensor,
-            prefix_score: torch.Tensor,
-            node_depth: torch.Tensor,
-            active: torch.Tensor,
-            slot_start: int,
-            width: int,
-        ) -> None:
-            block_pool = triton.next_power_of_2(int(pool_size))
-            _weaver_candidate_frontier_kernel[(logits.shape[0],)](
-                logits,
-                row_candidate_ids,
-                prefix_score,
-                node_depth,
-                active,
-                frontier_tokens,
-                frontier_parents,
-                frontier_depths,
-                frontier_scores,
-                frontier_logprobs,
-                frontier_active,
-                int(slot_start),
-                WIDTH=int(width),
-                POOL_SIZE=int(pool_size),
-                EXPAND_WIDTH=int(expand_width),
-                DEPTH=int(depth),
-                FRONTIER_SLOTS=int(frontier_slots),
-                BLOCK_POOL=int(block_pool),
-            )
-
-        def write_current_slot_cache(
             current_keys: torch.Tensor,
             current_values: torch.Tensor,
             parent_ancestors: torch.Tensor,
+            prefix_score: torch.Tensor,
             valid: torch.Tensor,
             node_depth: torch.Tensor,
             slot_start: int,
@@ -2474,16 +3231,31 @@ class DFlashTfmWorker(DFlashWorkerV2):
             total_kv = bs * width * num_layers * num_heads * head_dim
             total_ancestors = bs * width * depth
             block_size = 256
-            grid = (triton.cdiv(max(total_kv, total_ancestors), block_size),)
-            _weaver_current_cache_write_kernel[grid](
+            grid = (
+                max(
+                    triton.cdiv(total_kv, block_size),
+                    triton.cdiv(total_ancestors, block_size),
+                    bs * width,
+                ),
+            )
+            _weaver_publish_frontier_kernel[grid](
                 current_keys,
                 current_values,
                 node_keys,
                 node_values,
                 parent_ancestors,
                 slot_ancestors,
+                logits,
+                row_candidate_ids,
+                prefix_score,
                 valid,
                 node_depth,
+                frontier_tokens,
+                frontier_parents,
+                frontier_depths,
+                frontier_scores,
+                frontier_logprobs,
+                frontier_active,
                 int(slot_start),
                 BS=int(bs),
                 WIDTH=int(width),
@@ -2494,28 +3266,66 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 HEAD_DIM=int(head_dim),
                 TOTAL_KV=int(total_kv),
                 TOTAL_ANCESTORS=int(total_ancestors),
+                POOL_SIZE=int(pool_size),
+                EXPAND_WIDTH=int(expand_width),
+                FRONTIER_SLOTS=int(frontier_slots),
                 BLOCK_SIZE=int(block_size),
+                BLOCK_POOL=int(triton.next_power_of_2(pool_size)),
+            )
+
+        def materialize_frontier(slot_start: int, width: int) -> None:
+            frontier_limit = max(width, slot_start * expand_width)
+            _weaver_materialize_frontier_kernel[(bs,)](
+                frontier_tokens,
+                frontier_parents,
+                frontier_depths,
+                frontier_scores,
+                frontier_logprobs,
+                frontier_active,
+                slot_ancestors,
+                tokens,
+                parents,
+                depths,
+                node_mask,
+                draft_logprobs,
+                selected_tokens,
+                selected_depths,
+                selected_position_ids,
+                selected_candidate_rows,
+                selected_batch_indices,
+                selected_scores,
+                selected_active,
+                selected_parent_ancestors,
+                int(slot_start),
+                NUM_NODES=int(num_nodes),
+                DEPTH=int(depth),
+                FRONTIER_SLOTS=int(frontier_slots),
+                SELECT_WIDTH=int(width),
+                SCRATCH_WIDTH=int(batch_expand_width),
+                BLOCK_DEPTH=int(triton.next_power_of_2(depth)),
+                BLOCK_FRONTIER=int(triton.next_power_of_2(frontier_limit)),
+                FRONTIER_LIMIT=int(frontier_limit),
+                WRITE_ANCESTORS=slot_start + width <= node_budget,
+                num_warps=1,
             )
 
         def expand_node_indexed(
-            token: torch.Tensor,
-            node_depth: torch.Tensor,
+            token_ids: torch.Tensor,
+            position_ids: torch.Tensor,
+            candidate_row_index: torch.Tensor,
             parent_ancestors: torch.Tensor,
-            active: torch.Tensor,
             row_batch_indices: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            depth_index = node_depth.clamp(max=depth - 1)
-            candidate_row_index = row_batch_indices * depth + depth_index
-            row_candidate_ids = candidate_ids_rows[candidate_row_index]
             step_kwargs = dict(
-                token_ids=torch.where(active, token, torch.zeros_like(token)),
-                candidate_ids=row_candidate_ids,
-                candidate_weights=candidate_weights_rows[candidate_row_index],
-                candidate_scores=candidate_scores_rows[candidate_row_index],
+                token_ids=token_ids,
+                candidate_ids=candidate_ids_rows,
+                candidate_weights=candidate_weights_rows,
+                candidate_scores=candidate_scores_rows,
+                candidate_row_index=candidate_row_index,
                 external_keys=external_keys,
                 external_values=external_values,
                 external_mask=external_mask,
-                position_ids=depth_index,
+                position_ids=position_ids,
                 node_keys=node_keys,
                 node_values=node_values,
                 parent_ancestors=parent_ancestors.reshape(
@@ -2524,7 +3334,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 row_batch_indices=row_batch_indices,
                 token_embed=token_embed,
             )
-            logits, current_keys, current_values = (
+            logits, current_keys, current_values, row_candidate_ids = (
                 self._weaver_indexed_step_compiled(
                     **step_kwargs,
                 )
@@ -2540,103 +3350,64 @@ class DFlashTfmWorker(DFlashWorkerV2):
         root_logits, root_candidate_ids, root_keys, root_values = expand_node_indexed(
             root_ids,
             root_depth,
+            batch_indices * depth,
             root_parent_ancestors,
-            root_active,
             batch_indices,
         )
-        write_current_slot_cache(
+        publish_frontier(
+            root_logits,
+            root_candidate_ids,
             root_keys,
             root_values,
             root_parent_ancestors,
+            root_prefix_score,
             root_active[:, None],
             root_depth[:, None],
             0,
             1,
         )
-        write_candidate_frontier(
-            root_logits,
-            root_candidate_ids,
-            root_prefix_score,
-            root_depth,
-            root_active,
-            0,
-            1,
-        )
 
-        def gather_parent_ancestors(parent: torch.Tensor) -> torch.Tensor:
-            width = parent.shape[1]
-            gather_index = parent.clamp(min=0, max=num_nodes - 1)[:, :, None].expand(
-                bs, width, depth
-            )
-            return torch.gather(slot_ancestors, 1, gather_index)
-
-        row_base = batch_indices[:, None]
         slot_start = 1
         while slot_start <= node_budget:
             width = min(batch_expand_width, node_budget - slot_start + 1)
             slot_stop = slot_start + width
-            slot_slice = slice(slot_start, slot_stop)
-            slot_indices = node_indices[slot_slice]
-            masked_priorities = frontier_scores.masked_fill(
-                ~frontier_active, -torch.inf
-            )
-            _, frontier_index = torch.topk(masked_priorities, width, dim=1)
-            valid = frontier_active.gather(1, frontier_index)
-            token = frontier_tokens.gather(1, frontier_index)
-            parent = frontier_parents.gather(1, frontier_index)
-            node_depth = frontier_depths.gather(1, frontier_index)
-            node_score = frontier_scores.gather(1, frontier_index)
-            node_logprob = frontier_logprobs.gather(1, frontier_index)
-
-            tokens[:, slot_slice] = torch.where(
-                valid, token, torch.zeros_like(token)
-            )
-            parents[:, slot_slice] = torch.where(
-                valid, parent, torch.full_like(parent, -1)
-            )
-            depths[:, slot_slice] = torch.where(
-                valid, node_depth, torch.zeros_like(node_depth)
-            )
-            node_mask[:, slot_slice] = valid
-            draft_logprobs[:, slot_slice] = torch.where(
-                valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
-            )
-            frontier_active.scatter_(1, frontier_index, False)
+            materialize_frontier(slot_start, width)
+            valid = selected_active[:, :width]
+            token = selected_tokens[:, :width]
+            node_depth = selected_depths[:, :width]
+            node_score = selected_scores[:, :width]
+            parent_ancestors = selected_parent_ancestors[:, :width]
+            position_ids = selected_position_ids[:, :width]
+            candidate_row_index = selected_candidate_rows[:, :width]
+            row_batch_indices = selected_batch_indices[:, :width]
 
             if slot_stop > node_budget:
                 break
 
-            parent_ancestors = gather_parent_ancestors(parent)
             token_flat = token.reshape(bs * width)
             node_score_flat = node_score.reshape(bs * width)
             node_depth_flat = node_depth.reshape(bs * width)
             valid_flat = valid.reshape(bs * width)
-            row_batch_indices = (
-                row_base.expand(bs, width).reshape(bs * width).contiguous()
-            )
+            position_ids_flat = position_ids.reshape(bs * width)
+            candidate_row_index_flat = candidate_row_index.reshape(bs * width)
+            row_batch_indices_flat = row_batch_indices.reshape(bs * width)
 
             logits, row_candidate_ids, current_keys, current_values = expand_node_indexed(
                 token_flat,
-                node_depth_flat,
+                position_ids_flat,
+                candidate_row_index_flat,
                 parent_ancestors,
-                valid_flat,
-                row_batch_indices,
+                row_batch_indices_flat,
             )
-            write_current_slot_cache(
+            publish_frontier(
+                logits,
+                row_candidate_ids,
                 current_keys,
                 current_values,
                 parent_ancestors,
-                valid,
-                node_depth,
-                slot_start,
-                width,
-            )
-            write_candidate_frontier(
-                logits,
-                row_candidate_ids,
                 node_score_flat,
-                node_depth_flat,
                 valid_flat,
+                node_depth_flat,
                 slot_start,
                 width,
             )
@@ -3450,6 +4221,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             parent_indices=tree.parent_indices,
             node_mask=tree.node_mask,
             draft_logprobs=tree.draft_logprobs,
+            tree_sampling_mode=self.tree_sampling_mode,
         )
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input
@@ -3736,13 +4508,21 @@ class DFlashTfmWorker(DFlashWorkerV2):
             next_target_hidden,
             next_target_positions,
             next_output_norm,
-            num_correct_cpu,
+            _num_correct_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
             page_size=self.page_size,
             hidden_size=self.hidden_size,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+        )
+        committed_seq_lens_cpu, committed_seq_lens_ready = (
+            self._async_committed_seq_lens_cpu(
+                batch.seq_lens,
+                batch.seq_lens_cpu.dtype
+                if batch.seq_lens_cpu is not None
+                else torch.int32,
+            )
         )
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -3761,11 +4541,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             on_publish(new_seq_lens)
         append_cache_loc_2d = None
         append_commit_lens = None
-        if (
-            self.page_size > 1
-            and int(batch.out_cache_loc.numel())
-            == bs * int(verify_input.draft_token_num)
-        ):
+        if int(batch.out_cache_loc.numel()) == bs * int(verify_input.draft_token_num):
             append_cache_loc_2d = batch.out_cache_loc.view(
                 bs, int(verify_input.draft_token_num)
             )
@@ -3782,13 +4558,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
             bonus_tokens=new_bonus_tokens,
             new_seq_lens=new_seq_lens,
             output_norm=next_output_norm,
-            committed_seq_lens_cpu=(
-                batch.seq_lens_cpu.clone() if batch.seq_lens_cpu is not None else None
-            ),
+            committed_seq_lens_cpu=committed_seq_lens_cpu,
+            committed_seq_lens_ready=committed_seq_lens_ready,
         )
         batch.spec_info = next_draft_input
         batch.forward_mode = ForwardMode.DECODE
-        num_correct_drafts = sum(num_correct_cpu)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
@@ -3802,8 +4576,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 )
             ),
             new_seq_lens=new_seq_lens,
-            num_correct_drafts=num_correct_drafts,
-            num_correct_drafts_per_req_cpu=num_correct_cpu,
+            num_correct_drafts=0,
+            num_correct_drafts_per_req_cpu=None,
             can_run_cuda_graph=can_run_cuda_graph,
             extra_keep_alive_refs=[verify_forward_batch],
         )
