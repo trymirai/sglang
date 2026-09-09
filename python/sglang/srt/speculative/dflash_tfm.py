@@ -4341,7 +4341,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         if isinstance(verify_input, DFlashVerifyInput) and not isinstance(
             verify_input, DFlashTfmVerifyInput
         ):
-            need_mamba_verify_commit = hasattr(
+            need_mamba_verify_commit = self.target_worker.model_runner.mambaish_config is not None and hasattr(
                 self.target_worker.model_runner.attn_backend,
                 "update_mamba_state_after_mtp_verify",
             )
@@ -4482,7 +4482,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
 
         assert isinstance(verify_input, DFlashTfmVerifyInput)
 
-        need_mamba_verify_commit = hasattr(
+        need_mamba_verify_commit = self.target_worker.model_runner.mambaish_config is not None and hasattr(
             self.target_worker.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )

@@ -124,7 +124,7 @@ cmd_serve_ar() {
     --decode-attention-backend trtllm_mha \
     --prefill-attention-backend flashinfer \
     --host 127.0.0.1 \
-    --port "$PORT"
+    --port "$PORT" "$@"
 }
 
 cmd_serve_dflash() {
@@ -147,7 +147,7 @@ cmd_serve_dflash() {
     --speculative-dflash-block-size 16 \
     --speculative-num-draft-tokens 16 \
     --host 127.0.0.1 \
-    --port "$PORT"
+    --port "$PORT" "$@"
 }
 
 ensure_weaver_checkpoint() {
@@ -200,7 +200,7 @@ cmd_serve_tfm() {
     --speculative-gdn-verify-kernel chunk \
     --disable-overlap-schedule \
     --host 127.0.0.1 \
-    --port "$PORT"
+    --port "$PORT" "$@"
 }
 
 cmd_bench() {
@@ -213,7 +213,7 @@ cmd_bench() {
     --reasoning on \
     --max-new-tokens 4096 \
     --concurrency 1 \
-    --flush-cache-between-requests
+    --flush-cache-between-requests "$@"
 }
 
 command="${1:-}"

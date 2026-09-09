@@ -649,22 +649,37 @@ def _chat_prompt(user_text, reasoning):
 
 
 def _one_request(args, name, index, total, qid, text):
+    request_start = time.perf_counter()
     if args.flush_cache_between_requests:
         _flush_cache(args.base_url)
     sampling_params = {
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
-        "top_p": 1.0,
+        "top_p": args.top_p,
         "top_k": -1,
         "min_p": 0.0,
         "frequency_penalty": 0.0,
         "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
         "ignore_eos": False,
-        "sampling_seed": args.seed + index,
     }
+    if not args.server_rng:
+        sampling_params["sampling_seed"] = args.seed + index
+    prompt = (
+        args.tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=args.reasoning == "on",
+        ) if args.tokenizer else _chat_prompt(text, args.reasoning == "on")
+    )
+    # /generate tokenizes text with special tokens. Llama's template already
+    # includes BOS, so remove that one rendered BOS when the tokenizer adds it.
+    if args.tokenizer and args.tokenizer.bos_token and prompt.startswith(args.tokenizer.bos_token):
+        native_ids = args.tokenizer.encode(prompt, add_special_tokens=False)
+        without_bos = prompt[len(args.tokenizer.bos_token):]
+        if args.tokenizer.encode(without_bos) == native_ids:
+            prompt = without_bos
     payload = {
-        "text": _chat_prompt(text, args.reasoning == "on"),
+        "text": prompt,
         "sampling_params": sampling_params,
         "return_logprob": False,
         "stream": False,
@@ -685,7 +700,17 @@ def _one_request(args, name, index, total, qid, text):
             "tokens": completion_tokens,
             "steps": steps,
             "error": None,
+            "finish_reason": finish,
+            "server_latency": float(meta_info.get("e2e_latency", 0.0)),
+            "response_text": resp.get("text", ""),
+            "meta_info": meta_info,
+            "request_wall": time.perf_counter() - request_start,
         }
+        result.update(dataset=name, index=index, qid=qid,
+                      prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest())
+        if args.output_dir and name != "warmup":
+            with (args.output_dir / "requests.jsonl").open("a") as f:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
         print(
             f"[{name} {index + 1}/{total}] qid={qid} tokens={completion_tokens} "
             f"steps={steps} accept_length={completion_tokens / max(steps, 1):.2f} "
@@ -700,19 +725,47 @@ def _one_request(args, name, index, total, qid, text):
 
 def _run_dataset(args, name, questions):
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [
-            executor.submit(_one_request, args, name, index, len(questions), qid, text)
-            for index, (qid, text, _category) in enumerate(questions)
-        ]
-        results = [f.result() for f in futures]
-    wall = time.perf_counter() - start
+    diagnostic_wall = 0.0
+    interval = None
+    if args.adaptive_ar:
+        assert args.concurrency == 1
+        results = []
+        maximum = min(64, len(questions))
+        for index, (qid, text, _) in enumerate(questions[:maximum]):
+            results.append(_one_request(args, name, index, maximum, qid, text))
+            if len(results) in (16, 32, maximum):
+                check_start = time.perf_counter()
+                if any(r['error'] for r in results):
+                    raise RuntimeError('AR pilot contained failed requests')
+                rng = random.Random(args.subsample_seed)
+                samples = []
+                for _ in range(5000):
+                    sample = rng.choices(results, k=len(results))
+                    samples.append(sum(r['tokens'] for r in sample) / sum(r['request_wall'] for r in sample))
+                samples.sort()
+                estimate = sum(r['tokens'] for r in results) / sum(r['request_wall'] for r in results)
+                low, high = samples[125], samples[4874]
+                relative = max(estimate - low, high - estimate) / estimate
+                interval = dict(low=low, high=high, relative_half_width=relative,
+                                target=0.02, target_met=relative <= 0.02, n=len(results))
+                diagnostic_wall += time.perf_counter() - check_start
+                print(f'AR precision {name}: n={len(results)} relative_95ci={relative:.3%}', flush=True)
+                if relative <= 0.02:
+                    break
+    else:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = [
+                executor.submit(_one_request, args, name, index, len(questions), qid, text)
+                for index, (qid, text, _category) in enumerate(questions)
+            ]
+            results = [f.result() for f in futures]
+    wall = time.perf_counter() - start - diagnostic_wall
     tokens = sum(r["tokens"] for r in results)
     errors = sum(1 for r in results if r["error"])
     accept_lengths = [r["tokens"] / r["steps"] for r in results if r["steps"] > 0]
-    return {
+    row = {
         "dataset": name,
-        "prompts": len(questions),
+        "prompts": len(results),
         "errors": errors,
         "tokens": tokens,
         "wall": wall,
@@ -721,6 +774,12 @@ def _run_dataset(args, name, questions):
             sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0.0
         ),
     }
+    if interval:
+        scale = sum(r['request_wall'] for r in results) / wall
+        interval['low'] *= scale
+        interval['high'] *= scale
+        row['bootstrap_95ci'] = interval
+    return row
 
 
 def _parse_baseline(pairs):
@@ -785,6 +844,12 @@ def main():
     parser.add_argument("--model", default="", help="Recorded in the summary header only.")
     parser.add_argument("--datasets", nargs="+", default=["mtbench"])
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--tokenizer-path", help="Render the target model's native chat template.")
+    parser.add_argument("--server-rng", action="store_true", help="Use the fixed server seed; required by FlashInfer top-p sampling.")
+    parser.add_argument("--dataset-dir", type=Path, help="Frozen question JSON files, already shuffled and subsampled.")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--adaptive-ar", action="store_true", help="AR throughput estimate: 16/32/64 prompts until approximate bootstrap 95%% interval is within +/-2%%.")
     parser.add_argument("--reasoning", choices=("on", "off"), default="on")
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--concurrency", type=int, default=1)
@@ -812,6 +877,14 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--server-ready-timeout", type=float, default=120.0)
     args = parser.parse_args()
+    args.tokenizer = None
+    if args.tokenizer_path:
+        from transformers import AutoTokenizer
+        args.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, local_files_only=True)
+    if args.output_dir:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        if (args.output_dir / "requests.jsonl").exists():
+            raise SystemExit("Refusing to overwrite existing requests.jsonl")
 
     args.base_url = args.base_url.rstrip("/")
     names = [DATASET_ALIASES.get(n, n) for n in args.datasets]
@@ -830,6 +903,12 @@ def main():
 
     resolved = []
     for name in names:
+        if args.dataset_dir:
+            frozen = json.loads((args.dataset_dir / (name + ".json")).read_text())
+            selected = frozen["questions"]
+            print(f"dataset {name}: frozen {frozen['sha256']} ({len(selected)} prompts)")
+            resolved.append((name, selected))
+            continue
         questions, snapshot = _load_dataset(name, args.sharechat_path)
         limit = (
             args.per_dataset_limit
@@ -846,7 +925,11 @@ def main():
         _flush_cache(args.base_url)
 
     rows = [_run_dataset(args, name, selected) for name, selected in resolved]
+    if args.output_dir:
+        (args.output_dir / "summary.json").write_text(json.dumps(rows, indent=2) + "\n")
     _print_summary(args, rows, baseline)
+    if any(row["errors"] for row in rows):
+        raise SystemExit("Benchmark contained failed requests")
 
 
 if __name__ == "__main__":
