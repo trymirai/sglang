@@ -34,9 +34,13 @@ def _build(Root, Ids, Logp, Tok, Par, Dep, Mask, D: tl.constexpr,
     parent = tl.full((BLOCK,), 0, tl.int32)
     depth = tl.full((BLOCK,), 1, tl.int32)
     rank = tl.full((BLOCK,), 0, tl.int32)
-    # Rank+1 digits, zero padded: two base-128 keys encode up to depth 15.
-    hi = tl.where(x == 0, 1 << 49, 0).to(tl.int64)
-    lo = tl.full((BLOCK,), 0, tl.int64)
+    # Preserve the original base-128 path through budget 64. Budget 128 needs
+    # base-256 digits and unsigned keys (the first digit can set bit 63).
+    BITS: tl.constexpr = 8 if K > 64 else 7
+    KEY: tl.constexpr = tl.uint64 if K > 64 else tl.int64
+    KEY_MAX: tl.constexpr = 18446744073709551615 if K > 64 else 9223372036854775807
+    hi = tl.where(x == 0, 1 << (BITS * 7), 0).to(KEY)
+    lo = tl.full((BLOCK,), 0, KEY)
     root = tl.load(Root + batch)
     tl.store(Tok + batch * N, root)
     tl.store(Par + batch * N, -1)
@@ -44,8 +48,8 @@ def _build(Root, Ids, Logp, Tok, Par, Dep, Mask, D: tl.constexpr,
     tl.store(Mask + batch * N, 1)
     for node in range(1, N):
         best = tl.max(score, 0)
-        best_hi = tl.min(tl.where(score == best, hi, 9223372036854775807), 0)
-        best_lo = tl.min(tl.where((score == best) & (hi == best_hi), lo, 9223372036854775807), 0)
+        best_hi = tl.min(tl.where(score == best, hi, tl.full((), KEY_MAX, KEY)), 0)
+        best_lo = tl.min(tl.where((score == best) & (hi == best_hi), lo, tl.full((), KEY_MAX, KEY)), 0)
         winner = tl.min(tl.where((score == best) & (hi == best_hi) & (lo == best_lo), x, BLOCK), 0)
         selected = x == winner
         p = tl.sum(tl.where(selected, parent, 0), 0)
@@ -63,8 +67,8 @@ def _build(Root, Ids, Logp, Tok, Par, Dep, Mask, D: tl.constexpr,
         sibling_score = (best - old) + sibling
         score = tl.where(selected, sibling_score, score)
         rank = tl.where(selected, r + 1, rank)
-        hi = tl.where(selected & (d <= 8), best_hi + (tl.full((), 1, tl.int64) << (7 * (8 - d))), hi)
-        lo = tl.where(selected & (d > 8), best_lo + (tl.full((), 1, tl.int64) << (7 * (15 - d))), lo)
+        hi = tl.where(selected & (d <= 8), best_hi + (tl.full((), 1, KEY) << (BITS * (8 - d))), hi)
+        lo = tl.where(selected & (d > 8), best_lo + (tl.full((), 1, KEY) << (BITS * (15 - d))), lo)
         child_logp = tl.load(Logp + (batch * D + d) * K,
                             mask=valid & (d < D), other=-float('inf')).to(tl.float64)
         child = x == node
@@ -72,15 +76,15 @@ def _build(Root, Ids, Logp, Tok, Par, Dep, Mask, D: tl.constexpr,
         parent = tl.where(child, node, parent)
         depth = tl.where(child, d + 1, depth)
         rank = tl.where(child, 0, rank)
-        child_hi = best_hi + tl.where(d + 1 <= 8, (tl.full((), 1, tl.int64) << (7 * (7 - d))), 0)
-        child_lo = best_lo + tl.where(d + 1 > 8, (tl.full((), 1, tl.int64) << (7 * (14 - d))), 0)
+        child_hi = best_hi + tl.where(d + 1 <= 8, (tl.full((), 1, KEY) << (BITS * (7 - d))), 0)
+        child_lo = best_lo + tl.where(d + 1 > 8, (tl.full((), 1, KEY) << (BITS * (14 - d))), 0)
         hi = tl.where(child, child_hi, hi)
         lo = tl.where(child, child_lo, lo)
 
 
 def build_ddtree_gpu(*, root_ids, top_token_ids, top_log_probs, budget):
     b, d, k = top_token_ids.shape
-    assert 0 < d <= 15 and 0 < k <= 64 and 0 < budget <= 64
+    assert 0 < d <= 15 and 0 < k <= 128 and 0 < budget <= 128
     n = budget + 1
     tok = torch.empty((b, n), dtype=torch.int64, device=root_ids.device)
     par = torch.empty_like(tok)

@@ -2689,8 +2689,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
             self.server_args.speculative_dflash_tfm_tree_sampling_mode
         )
         if self.use_ddtree:
-            if not 1 <= self.tree_budget <= 64 or not 2 <= self.block_size <= 16:
-                raise ValueError("DDTree supports budgets 1..64 and block sizes 2..16.")
+            if not 1 <= self.tree_budget <= 128 or not 2 <= self.block_size <= 16:
+                raise ValueError("DDTree supports budgets 1..128 and block sizes 2..16.")
             if self.tree_sampling_mode != "target_only":
                 raise ValueError("Deterministic DDTree requires target_only verification.")
             if self.server_args.speculative_dflash_tfm_candidate_pool_size is not None:
