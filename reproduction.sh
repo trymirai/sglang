@@ -25,6 +25,7 @@ Usage:
   sh reproduction.sh serve-ar
   sh reproduction.sh serve-dflash
   sh reproduction.sh serve-tfm
+  sh reproduction.sh serve-ddtree
       Launch one serving configuration on the selected PORT (default 30000).
 
   sh reproduction.sh download
@@ -97,6 +98,7 @@ run_in_container() {
       serve-ar) cmd_serve_ar "$@" ;;
       serve-dflash) cmd_serve_dflash "$@" ;;
       serve-tfm) cmd_serve_tfm "$@" ;;
+      serve-ddtree) cmd_serve_ddtree "$@" ;;
       download) cmd_download "$@" ;;
       bench) cmd_bench "$@" ;;
       *)
@@ -203,6 +205,32 @@ cmd_serve_tfm() {
     --port "$PORT" "$@"
 }
 
+cmd_serve_ddtree() {
+  export_common_env
+  python3 -m sglang.launch_server \
+    --model-path "$TARGET_MODEL" \
+    --revision "$TARGET_REV" \
+    --dtype bfloat16 \
+    --tp-size 1 \
+    --max-running-requests 1 \
+    --cuda-graph-max-bs 32 \
+    --mem-fraction-static 0.75 \
+    --page-size 64 \
+    --disable-radix-cache \
+    --decode-attention-backend trtllm_mha \
+    --prefill-attention-backend flashinfer \
+    --speculative-draft-attention-backend fa4 \
+    --speculative-algorithm DFLASH_TFM \
+    --speculative-draft-model-path "$DFLASH_MODEL" \
+    --speculative-draft-model-revision "$DFLASH_REV" \
+    --speculative-dflash-tfm-proposal ddtree \
+    --speculative-dflash-tfm-tree-budget 64 \
+    --speculative-gdn-verify-kernel chunk \
+    --disable-overlap-schedule \
+    --host 127.0.0.1 \
+    --port "$PORT" "$@"
+}
+
 cmd_bench() {
   export_common_env
   python3 -m sglang.bench_dflash_tfm \
@@ -226,6 +254,7 @@ case "$command" in
   serve-ar) run_in_container serve-ar "$@" ;;
   serve-dflash) run_in_container serve-dflash "$@" ;;
   serve-tfm) run_in_container serve-tfm "$@" ;;
+  serve-ddtree) run_in_container serve-ddtree "$@" ;;
   download) run_in_container download "$@" ;;
   bench) run_in_container bench "$@" ;;
   ""|-h|--help|help) usage ;;

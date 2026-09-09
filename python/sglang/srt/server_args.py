@@ -1521,6 +1521,11 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tfm_proposal: A[
+        str,
+        Arg(help="Proposal builder using the shared DFlash tree verification runtime.",
+            choices=["weaver", "ddtree"]),
+    ] = "weaver"
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",

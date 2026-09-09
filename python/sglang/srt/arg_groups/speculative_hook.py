@@ -148,7 +148,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
     if is_tfm:
-        if server_args.speculative_dflash_tfm_path is None:
+        if (server_args.speculative_dflash_tfm_path is None
+                and server_args.speculative_dflash_tfm_proposal != "ddtree"):
             raise ValueError(
                 "DFLASH_TFM requires setting --speculative-dflash-tfm-path."
             )

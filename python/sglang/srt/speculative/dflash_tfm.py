@@ -2670,8 +2670,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             super().__init__(*args, **kwargs)
         finally:
             server_args.speculative_num_draft_tokens = target_verify_tokens
+        self.use_ddtree = self.server_args.speculative_dflash_tfm_proposal == "ddtree"
         path = self.server_args.speculative_dflash_tfm_path
-        if path is None:
+        if path is None and not self.use_ddtree:
             raise ValueError(
                 "DFLASH_TFM requires --speculative-dflash-tfm-path."
             )
@@ -2680,27 +2681,39 @@ class DFlashTfmWorker(DFlashWorkerV2):
         )
         if not isinstance(dtype, torch.dtype):
             dtype = torch.bfloat16
-        self.weaver = Weaver.load(
-            path,
-            device=self.device,
-            dtype=dtype,
+        self.weaver = None if self.use_ddtree else Weaver.load(
+            path, device=self.device, dtype=dtype,
         )
         self.tree_budget = int(self.server_args.speculative_dflash_tfm_tree_budget or 128)
         self.tree_sampling_mode = (
             self.server_args.speculative_dflash_tfm_tree_sampling_mode
         )
-        requested_pool_size = int(
-            self.server_args.speculative_dflash_tfm_candidate_pool_size
-            or self.weaver.candidate_pool_size
-        )
-        if requested_pool_size <= 0:
-            raise ValueError(
-                "DFLASH_TFM candidate pool size must be positive, "
-                f"got {requested_pool_size}."
+        if self.use_ddtree:
+            if not 1 <= self.tree_budget <= 64 or not 2 <= self.block_size <= 16:
+                raise ValueError("DDTree supports budgets 1..64 and block sizes 2..16.")
+            if self.tree_sampling_mode != "target_only":
+                raise ValueError("Deterministic DDTree requires target_only verification.")
+            if self.server_args.speculative_dflash_tfm_candidate_pool_size is not None:
+                raise ValueError("Official DDTree uses top-k equal to its non-root budget.")
+            self.candidate_pool_size = self.tree_budget
+            import os
+            self.ddtree_audit_path = os.environ.get("SGLANG_DDTREE_AUDIT")
+            self.ddtree_audit_left = 2 if self.ddtree_audit_path else 0
+            logger.info("DDTree proposal: budget=%s non-root, topk=%s, no Weaver loaded",
+                        self.tree_budget, self.candidate_pool_size)
+        else:
+            requested_pool_size = int(
+                self.server_args.speculative_dflash_tfm_candidate_pool_size
+                or self.weaver.candidate_pool_size
             )
-        self.candidate_pool_size = min(
-            requested_pool_size, int(self.weaver.candidate_pool_size)
-        )
+            if requested_pool_size <= 0:
+                raise ValueError(
+                    "DFLASH_TFM candidate pool size must be positive, "
+                    f"got {requested_pool_size}."
+                )
+            self.candidate_pool_size = min(
+                requested_pool_size, int(self.weaver.candidate_pool_size)
+            )
         if get_tp_group().world_size != 1:
             raise NotImplementedError(
                 "DFLASH_TFM MVP supports tensor_parallel_size=1 only."
@@ -2720,6 +2733,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
             self.server_args.speculative_num_draft_tokens or self.block_size
         )
         self.use_chain_verify = self.target_verify_tokens <= int(self.block_size)
+        if self.use_ddtree and self.use_chain_verify:
+            raise ValueError("DDTree requires a tree verification width exceeding block size.")
         self._committed_seq_lens_d2h_stream = (
             torch.cuda.Stream(device=self.device) if is_cuda() else None
         )
@@ -2867,6 +2882,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
         if num_org > 0 and num_added == 0:
             logits = torch.matmul(hs, weight[:num_org].T).float()
             values, indices = torch.topk(logits, min(int(k), logits.shape[-1]), dim=-1)
+            if self.use_ddtree:
+                values = values - torch.logsumexp(logits, dim=-1, keepdim=True)
             return values, indices.to(torch.long) + org_vocab_start
 
         logits_parts = []
@@ -2896,6 +2913,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
         ids = torch.cat(ids_parts, dim=0)
         _, indices = torch.topk(logits, min(int(k), logits.shape[-1]), dim=-1)
         values = torch.gather(logits, 1, indices)
+        if self.use_ddtree:
+            values = values - torch.logsumexp(logits, dim=-1, keepdim=True)
         return values, ids[indices]
 
     def _weaver_indexed_step_compiled(
@@ -3946,6 +3965,18 @@ class DFlashTfmWorker(DFlashWorkerV2):
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
     ) -> WeaverTree:
+        if self.use_ddtree:
+            from sglang.srt.speculative.ddtree import build_ddtree_gpu
+            tree = build_ddtree_gpu(root_ids=root_ids, top_token_ids=candidate_ids,
+                                    top_log_probs=candidate_scores, budget=self.tree_budget)
+            if self.ddtree_audit_left:
+                torch.save(dict(root_ids=root_ids.cpu(), top_token_ids=candidate_ids.cpu(),
+                                top_log_probs=candidate_scores.cpu(), budget=self.tree_budget,
+                                tree={k: getattr(tree, k).cpu() for k in
+                                      ("draft_tokens", "parent_indices", "depths", "node_mask")}),
+                           f"{self.ddtree_audit_path}-{2 - self.ddtree_audit_left}.pt")
+                self.ddtree_audit_left -= 1
+            return tree
         if root_ids.device.type == "cuda":
             return self._build_tree_with_cuda_graph(
                 root_ids=root_ids,
@@ -4133,7 +4164,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 "DFLASH_TFM draft model returned no hidden states."
             )
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        depth = min(self.block_size - 1, self.weaver.K)
+        depth = self.block_size - 1 if self.use_ddtree else min(self.block_size - 1, self.weaver.K)
         proposal_features = draft_hidden[:, 1 : 1 + depth].contiguous()
         scores, ids = self._topk_from_lm_head(
             proposal_features.reshape(bs * depth, proposal_features.shape[-1]),
@@ -4142,9 +4173,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
         )
         candidate_scores = scores.view(bs, depth, -1)
         candidate_ids = ids.view(bs, depth, -1)
-        residual_lm_head = self._weaver_residual_lm_head(lm_head)
-        candidate_weights = residual_lm_head[candidate_ids.clamp_min(0)]
-        token_embed = self._weaver_token_embed(embed_module)
+        if self.use_ddtree:
+            candidate_weights = token_embed = None
+        else:
+            residual_lm_head = self._weaver_residual_lm_head(lm_head)
+            candidate_weights = residual_lm_head[candidate_ids.clamp_min(0)]
+            token_embed = self._weaver_token_embed(embed_module)
         if self.use_chain_verify:
             draft_token_num = min(int(self.target_verify_tokens), block_size)
             if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
