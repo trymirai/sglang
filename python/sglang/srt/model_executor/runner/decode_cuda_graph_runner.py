@@ -412,6 +412,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        # Tree masks and positions describe local requests only. DP gathering
+        # can choose a larger bucket even when the local batch has an exact one.
+        if (
+            self.model_runner.spec_algorithm.is_dflash_tfm()
+            and self.model_runner.sliding_window_size is not None
+            and (
+                cuda_graph_bs != forward_batch.batch_size
+                or cuda_graph_bs not in self.capture_bs
+            )
+        ):
+            return False
+
         graph_key = cuda_graph_bs
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
@@ -1081,12 +1093,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 resolve_dflash_verify_mask_policy,
             )
 
-            if (
+            is_tree = (
                 hasattr(self.model_runner.spec_algorithm, "is_dflash_tfm")
                 and self.model_runner.spec_algorithm.is_dflash_tfm()
                 and self.model_runner.server_args.speculative_num_draft_tokens
                 != self.model_runner.server_args.speculative_dflash_block_size
-            ):
+            )
+            if is_tree:
                 # Tree-mode verify always needs the tree custom mask.
                 build_custom_mask = True
             else:
@@ -1099,6 +1112,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                is_tree=is_tree,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

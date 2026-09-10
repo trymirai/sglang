@@ -2250,6 +2250,29 @@ def _target_only_verify_target_probs(
     return predict, accept_index, num_correct
 
 
+@triton.jit
+def _tree_sliding_window_mask(
+    tree_mask, positions, prefix_lens, prefix_offsets, output,
+    WIDTH: tl.constexpr, WINDOW_LEFT: tl.constexpr, BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    row = tl.program_id(1)
+    prefix = tl.load(prefix_lens + request)
+    offset = (tl.load(prefix_offsets + request) + request * WIDTH) * WIDTH
+    col = tl.arange(0, BLOCK)
+    valid = col < prefix + WIDTH
+    index = offset + row * (prefix + WIDTH) + col
+    allowed = tl.load(tree_mask + index, valid, other=False)
+    query_position = tl.load(positions + request * WIDTH + row)
+    tree_position = tl.load(
+        positions + request * WIDTH + col - prefix,
+        valid & (col >= prefix), other=0,
+    )
+    key_position = tl.where(col < prefix, col, tree_position)
+    distance = query_position - key_position
+    tl.store(output + index, allowed & (distance >= 0) & (distance <= WINDOW_LEFT), valid)
+
+
 class DFlashTfmVerifyInput(DFlashVerifyInput):
     def __init__(
         self,
@@ -2274,6 +2297,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             positions=positions,
             draft_token_num=int(draft_token_num),
             topk=2,
+            is_tree=True,
             custom_mask=custom_mask,
             capture_hidden_mode=capture_hidden_mode,
         )
@@ -2369,6 +2393,27 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             req_to_token,
             kv_start_idx,
         )
+
+    def generate_swa_attn_arg_prefill(
+        self, req_pool_indices, prefix_lens, prefix_lens_sum, req_to_token,
+        *, window_left: int,
+    ):
+        # Keep the full prefix layout: a packed tree slot is not a token position.
+        if self.mask_seq_lens_cpu is None:
+            raise ValueError("SWA tree verification requires logical prefix lengths.")
+        kv_indices, kv_indptr, qo_indptr, mask = self.generate_attn_arg_prefill(
+            req_pool_indices, prefix_lens, prefix_lens_sum, req_to_token
+        )
+        offsets = torch.zeros_like(prefix_lens)
+        offsets[1:] = torch.cumsum(prefix_lens[:-1], dim=0)
+        swa_mask = torch.empty_like(mask)
+        width = int(self.draft_token_num)
+        _tree_sliding_window_mask[(len(prefix_lens), width)](
+            mask, self.positions, prefix_lens, offsets, swa_mask,
+            WIDTH=width, WINDOW_LEFT=int(window_left),
+            BLOCK=triton.next_power_of_2(int(self.mask_seq_lens_cpu.max()) + width),
+        )
+        return kv_indices, kv_indptr, qo_indptr, swa_mask
 
     def _verify_from_target_predict(self, target_predict: torch.Tensor, bs: int):
         candidates = self.draft_token.view(bs, self.draft_token_num)

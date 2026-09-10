@@ -371,6 +371,7 @@ def create_dummy_verify_input(
             draft_token=None,
             positions=None,
             draft_token_num=server_args.speculative_num_draft_tokens,
+            is_tree=use_tree_metadata,
             custom_mask=custom_mask if use_tree_metadata else None,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,

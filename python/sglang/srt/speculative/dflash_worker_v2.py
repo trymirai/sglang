@@ -1571,9 +1571,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
+        # HybridAttnBackend also wraps pure attention backends and exposes the
+        # delegation method even when the target has no recurrent state.
+        need_mamba_verify_commit = (
+            self.target_worker.model_runner.mambaish_config is not None
+            and hasattr(
+                self.target_worker.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
         )
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None

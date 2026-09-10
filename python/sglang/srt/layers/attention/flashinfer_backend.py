@@ -374,7 +374,12 @@ class FlashInferAttnBackend(AttentionBackend):
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
-        self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        # The ragged wrapper shares one plan across all layers. Muse mixes SWA
+        # and full attention, which need different compile-time window flags.
+        self.use_paged = (
+            envs.SGLANG_FLASHINFER_USE_PAGED.get()
+            or model_runner.model_config.hf_text_config.model_type == "muse_glimmer"
+        )
 
         # Allocate buffers
         global global_workspace_buffer
@@ -861,11 +866,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            self.cuda_graph_custom_mask = [
+                torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                for _ in range(self.num_wrappers)
+            ]
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -894,7 +902,7 @@ class FlashInferAttnBackend(AttentionBackend):
         for i in range(self.num_wrappers):
             extra = (
                 {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "custom_mask_buf": self.cuda_graph_custom_mask[i],
                     "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
                 }
                 if use_custom_mask
@@ -1001,8 +1009,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 window_left=(
                     layer.sliding_window_size
                     if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
+                        (self.forward_metadata.multi_item_params
+                         and self.forward_metadata.multi_item_params.is_enabled())
+                        or (forward_batch.spec_info is not None
+                            and forward_batch.spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                            and forward_batch.spec_info.is_tree)
                     )
                     else -1
                 ),
@@ -1532,8 +1543,20 @@ class FlashInferIndicesUpdaterPrefill:
         assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
+            dflash_swa = (
+                wrapper_id == 0
+                and spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            )
+            tree_swa = dflash_swa and spec_info.is_tree
             if wrapper_id == 0:
-                if use_ragged:
+                if dflash_swa:
+                    if self._swa_kv_pool is not None:
+                        raise ValueError("SWA DFlash verification requires --disable-hybrid-swa-memory.")
+                    paged_kernel_lens = seq_lens
+                    paged_kernel_lens_sum = seq_lens_sum
+                    kv_start_idx = torch.zeros_like(seq_lens)
+                elif use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens
                     # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
@@ -1580,6 +1603,13 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                tree_swa_window=sliding_window_size if tree_swa else None,
+                window_left=(
+                    sliding_window_size
+                    if (wrapper_id == 0 and not tree_swa and not use_ragged
+                        and not (multi_item_params and multi_item_params.is_enabled()))
+                    else -1
+                ),
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1690,6 +1720,8 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        tree_swa_window: Optional[int] = None,
+        window_left: int = -1,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1719,15 +1751,19 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
+                if tree_swa_window is not None:
+                    kv_indices, kv_indptr, qo_indptr, custom_mask = spec_info.generate_swa_attn_arg_prefill(
+                        req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum,
+                        self.req_to_token, window_left=tree_swa_window,
+                    )
+                else:
+                    kv_indices, kv_indptr, qo_indptr, custom_mask = spec_info.generate_attn_arg_prefill(
                         req_pool_indices,
                         paged_kernel_lens,
                         paged_kernel_lens_sum,
                         self.req_to_token,
                         kv_start_idx=kv_start_idx,
                     )
-                )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -1821,6 +1857,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
+            window_left=window_left,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
             prefix_len_ptr=prefix_len_ptr,

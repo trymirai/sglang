@@ -33,6 +33,7 @@ class DFlashVerifyInput(SpecInput):
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
+    is_tree: bool = False
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
@@ -94,6 +95,16 @@ class DFlashVerifyInput(SpecInput):
             )
 
         return verify_forward_batch, can_run_cuda_graph
+
+    def generate_swa_attn_arg_prefill(
+        self, req_pool_indices, prefix_lens, prefix_lens_sum, req_to_token,
+        *, window_left: int,
+    ):
+        # CUDA graph capture uses this base input with dummy mask values. Live
+        # TfM inputs override this method and populate the logical-position mask.
+        return self.generate_attn_arg_prefill(
+            req_pool_indices, prefix_lens, prefix_lens_sum, req_to_token
+        )
 
     def generate_attn_arg_prefill(
         self,

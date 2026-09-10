@@ -381,8 +381,17 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        # Prefill/decode hybrids must use the same backend selection as verify.
+        # Otherwise graph capture enables a custom mask that chain verify never
+        # supplies, leaving FlashInfer to replay an uninitialized mask buffer.
+        select_backend = getattr(backend, "_select_backend", None)
+        if select_backend is not None:
+            backend = select_backend(ForwardMode.TARGET_VERIFY)
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -780,7 +789,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"got {mask_token!r}."
         )
 
-    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    mask_token_id = dflash_cfg.get(
+        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
+    )
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
@@ -975,7 +986,9 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
-    if use_sparse_topk and need_top_k:
+    # Joint top-k/top-p filtering uses nucleus mass from the full vocabulary.
+    # Renormalizing a sparse top-k subset first changes that distribution.
+    if use_sparse_topk and need_top_k and not need_top_p:
         repeated_top_ks = torch.repeat_interleave(
             sampling_info.top_ks, draft_token_num, dim=0
         ).to(dtype=torch.int64)
@@ -990,7 +1003,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        # Sparse exact path for top-k alone, then scatter to dense.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
@@ -1001,27 +1014,21 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
             topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
-
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
         if need_top_p:
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        if need_top_k:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
 

@@ -59,7 +59,13 @@ def _get_dflash_layer_attention_params(
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.DECODER
+        # Meta's original assistant uses bidirectional sliding attention.
+        attn_type = (
+            AttentionType.ENCODER_ONLY
+            if config.model_type == "muse_glimmer_assistant"
+            else AttentionType.DECODER
+        )
+        return sliding_window_size, attn_type
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
@@ -331,10 +337,9 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
+        target_num_layers = int(
+            draft_config.num_target_layers
+            or (max(draft_config.target_layer_ids) + 1 if draft_config.target_layer_ids else num_layers)
         )
         target_layer_ids = draft_config.resolve_target_layer_ids(
             target_num_layers=target_num_layers, draft_num_layers=num_layers
@@ -410,8 +415,14 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        encoder_aliases = {
+            "encoder.fc.weight": "fc.weight",
+            "encoder.output_norm_enc.weight": "hidden_norm.weight",
+        }
+        loaded_params = set()
 
         def resolve_param_name(name: str) -> Optional[str]:
+            name = encoder_aliases.get(name, name)
             if name in params_dict:
                 return name
             if name.startswith("model."):
@@ -435,6 +446,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add((resolved_name, shard_id))
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -454,6 +466,22 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add((resolved_name, None))
+
+        if getattr(self.config, "model_type", None) == "muse_glimmer_assistant":
+            expected = {
+                (name, shard)
+                for name in params_dict
+                for shard in (("q", "k", "v") if ".qkv_proj." in name else
+                              (0, 1) if ".gate_up_proj." in name else (None,))
+            }
+            missing = expected - loaded_params
+            if missing:
+                raise ValueError(f"Muse DFlash checkpoint is missing weights: {sorted(missing)}")
 
 
-EntryClass = DFlashDraftModel
+class MuseGlimmerAssistantModel(DFlashDraftModel):
+    """Meta's original block16 DFlash assistant, using the raw shared LM head."""
+
+
+EntryClass = [DFlashDraftModel, MuseGlimmerAssistantModel]
