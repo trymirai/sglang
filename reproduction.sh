@@ -27,6 +27,8 @@ Usage:
   sh reproduction.sh serve-tfm
   sh reproduction.sh serve-ddtree
       Launch one serving configuration on the selected PORT (default 30000).
+      DDTree/TfM use overlap scheduling by default (including weaver_uzu).
+      Append --disable-overlap-schedule to opt out.
 
   sh reproduction.sh download
       Download and verify the Weaver checkpoint used by DFlash-TfM.
@@ -200,7 +202,6 @@ cmd_serve_tfm() {
     --speculative-dflash-tfm-path "$WEAVER_CKPT" \
     --speculative-dflash-tfm-tree-budget 64 \
     --speculative-gdn-verify-kernel chunk \
-    --disable-overlap-schedule \
     --host 127.0.0.1 \
     --port "$PORT" "$@"
 }
@@ -226,7 +227,6 @@ cmd_serve_ddtree() {
     --speculative-dflash-tfm-proposal ddtree \
     --speculative-dflash-tfm-tree-budget 64 \
     --speculative-gdn-verify-kernel chunk \
-    --disable-overlap-schedule \
     --host 127.0.0.1 \
     --port "$PORT" "$@"
 }

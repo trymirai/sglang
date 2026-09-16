@@ -1523,9 +1523,31 @@ class ServerArgs:
     ] = None
     speculative_dflash_tfm_proposal: A[
         str,
-        Arg(help="Proposal builder using the shared DFlash tree verification runtime.",
-            choices=["weaver", "ddtree"]),
+        Arg(
+            help=(
+                "Proposal builder: weaver (batched best-first), weaver_uzu "
+                "(configurable deterministic grow-and-prune), "
+                "or ddtree."
+            ),
+            choices=["weaver", "weaver_uzu", "ddtree"],
+        ),
     ] = "weaver"
+    speculative_dflash_tfm_uzu_rounds: A[
+        int,
+        "weaver_uzu only. Total expansion rounds R, including the root expansion.",
+    ] = 16
+    speculative_dflash_tfm_uzu_width: A[
+        int,
+        "weaver_uzu only. Maximum frontier parents W expanded per round (1..32).",
+    ] = 2
+    speculative_dflash_tfm_uzu_children: A[
+        int,
+        "weaver_uzu only. Deterministic Top-C children per parent; must not exceed the candidate pool.",
+    ] = 32
+    speculative_dflash_tfm_uzu_max_depth: A[
+        Optional[int],
+        "weaver_uzu only. Maximum non-root depth. Defaults to min(DFlash block size - 1, Weaver checkpoint K).",
+    ] = None
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",

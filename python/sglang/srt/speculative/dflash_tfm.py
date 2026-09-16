@@ -2716,6 +2716,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         finally:
             server_args.speculative_num_draft_tokens = target_verify_tokens
         self.use_ddtree = self.server_args.speculative_dflash_tfm_proposal == "ddtree"
+        self.use_uzu_tree = self.server_args.speculative_dflash_tfm_proposal == "weaver_uzu"
         path = self.server_args.speculative_dflash_tfm_path
         if path is None and not self.use_ddtree:
             raise ValueError(
@@ -2729,7 +2730,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
         self.weaver = None if self.use_ddtree else Weaver.load(
             path, device=self.device, dtype=dtype,
         )
-        self.tree_budget = int(self.server_args.speculative_dflash_tfm_tree_budget or 128)
+        self.tree_budget = int(
+            self.server_args.speculative_dflash_tfm_tree_budget
+            if self.server_args.speculative_dflash_tfm_tree_budget is not None
+            else 128
+        )
         self.tree_sampling_mode = (
             self.server_args.speculative_dflash_tfm_tree_sampling_mode
         )
@@ -2759,6 +2764,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
             self.candidate_pool_size = min(
                 requested_pool_size, int(self.weaver.candidate_pool_size)
             )
+            if self.use_uzu_tree:
+                from sglang.srt.speculative.uzu_tree import configure_uzu_tree
+
+                configure_uzu_tree(self)
         if get_tp_group().world_size != 1:
             raise NotImplementedError(
                 "DFLASH_TFM MVP supports tensor_parallel_size=1 only."
@@ -2777,7 +2786,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
         self.target_verify_tokens = int(
             self.server_args.speculative_num_draft_tokens or self.block_size
         )
-        self.use_chain_verify = self.target_verify_tokens <= int(self.block_size)
+        self.use_chain_verify = (
+            not self.use_uzu_tree
+            and self.target_verify_tokens <= int(self.block_size)
+        )
         if self.use_ddtree and self.use_chain_verify:
             raise ValueError("DDTree requires a tree verification width exceeding block size.")
         self._committed_seq_lens_d2h_stream = (
@@ -2823,7 +2835,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             return seq_lens.to(device="cpu", dtype=dtype), None
 
     def init_attention_backends(self):
-        if self.target_verify_tokens <= int(self.block_size):
+        if not self.use_uzu_tree and self.target_verify_tokens <= int(self.block_size):
             backend_name = _tree_attention_backend_name(
                 self.target_worker.model_runner.attn_backend
             )
@@ -3191,6 +3203,19 @@ class DFlashTfmWorker(DFlashWorkerV2):
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
     ) -> WeaverTree:
+        if self.use_uzu_tree:
+            from sglang.srt.speculative.uzu_tree import build_uzu_tree
+
+            return build_uzu_tree(
+                self,
+                root_ids=root_ids,
+                output_norm=output_norm,
+                candidate_ids=candidate_ids,
+                candidate_weights=candidate_weights,
+                candidate_scores=candidate_scores,
+                proposal_features=proposal_features,
+                token_embed=token_embed,
+            )
         bs, depth, pool_size = candidate_ids.shape
         node_budget = int(self.tree_budget)
         num_nodes = node_budget + 1
