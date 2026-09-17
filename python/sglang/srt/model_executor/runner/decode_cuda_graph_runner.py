@@ -1088,16 +1088,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     device=self.model_runner.device,
                 )
         elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.layers.attention.linear.utils import (
+                gdn_dflash_tfm_tree_verify_enabled,
+            )
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
             )
 
             is_tree = (
-                hasattr(self.model_runner.spec_algorithm, "is_dflash_tfm")
-                and self.model_runner.spec_algorithm.is_dflash_tfm()
-                and self.model_runner.server_args.speculative_num_draft_tokens
-                != self.model_runner.server_args.speculative_dflash_block_size
+                not self.model_runner.is_draft_worker
+                and gdn_dflash_tfm_tree_verify_enabled(self.model_runner.server_args)
             )
             if is_tree:
                 # Tree-mode verify always needs the tree custom mask.

@@ -1521,6 +1521,15 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_sampling_coupling: A[
+        str,
+        Arg(
+            help="Sampling RNG: native, or position-stable shared Gumbel-max for "
+            "AR/UzuTree (TP=1). shared_gumbel requires an explicit sampling_seed "
+            "per request and uses Gumbel Top-C for Uzu proposals.",
+            choices=["native", "shared_gumbel"],
+        ),
+    ] = "native"
     speculative_dflash_tfm_proposal: A[
         str,
         Arg(
@@ -6913,6 +6922,19 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def check_server_args(self):
+        if self.speculative_sampling_coupling == "shared_gumbel":
+            is_uzu = (
+                self.speculative_algorithm == "DFLASH_TFM"
+                and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+                and self.speculative_dflash_tfm_tree_sampling_mode == "target_only"
+            )
+            if self.tp_size != 1 or (
+                self.speculative_algorithm is not None and not is_uzu
+            ):
+                raise ValueError(
+                    "shared_gumbel supports AR or DFLASH_TFM with weaver_uzu, "
+                    "target_only verification, and TP=1."
+                )
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

@@ -1,8 +1,8 @@
-"""Configurable deterministic Uzu-style grow-and-prune tree.
+"""Uzu-style grow-and-prune tree with deterministic or shared-Gumbel Top-C.
 
-Port of the measured C32/W2 path in uzu-cw-sweep-20260916. Weaver inference,
-DFlash candidate pools and target-only verification remain in dflash_tfm.
-No proposal RNG or experimental profiling hooks are used here.
+Gumbel noise affects child selection only. Frontier priority and final pruning
+use unperturbed cumulative log probabilities. Weaver inference and verification
+remain in dflash_tfm.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import triton.language as tl
 
 # Loaded lazily by DFlashTfmWorker after dflash_tfm finishes importing.
 from sglang.srt.speculative.dflash_tfm import WeaverTree
+from sglang.srt.speculative.shared_gumbel import gumbel_at
 
 def configure_uzu_tree(worker) -> None:
     args = worker.server_args
@@ -51,8 +52,8 @@ def configure_uzu_tree(worker) -> None:
         )
     if worker.tree_sampling_mode != "target_only":
         raise ValueError(
-            "weaver_uzu uses deterministic Top-C proposals and requires target_only "
-            "verification; traversal requires sampled sibling proposals."
+            "weaver_uzu requires target_only verification; "
+            "its pruned proposals do not implement traversal rejection."
         )
 
 
@@ -292,6 +293,11 @@ def _uzu_publish_frontier_kernel(
     frontier_logprobs_ptr,
     frontier_active_ptr,
     slot_start,
+    gumbel_seeds,
+    gumbel_positions,
+    gumbel_temperatures,
+    gumbel_scale,
+    SHARED_GUMBEL: tl.constexpr,
     BS: tl.constexpr,
     WIDTH: tl.constexpr,
     DEPTH: tl.constexpr,
@@ -367,9 +373,16 @@ def _uzu_publish_frontier_kernel(
             other=-float("inf"),
         ).to(tl.float32)
         raw_scores = tl.where((token_ids >= 0) & pool_mask, raw_scores, -float("inf"))
-        selection_scores = raw_scores
         parent_score = tl.load(prefix_score_ptr + program)
         parent_depth = tl.load(node_depth_ptr + program)
+        if SHARED_GUMBEL:
+            row_batch = program // WIDTH
+            raw_scores = raw_scores / tl.load(gumbel_temperatures + row_batch)
+            selection_scores = raw_scores + tl.load(gumbel_scale) * gumbel_at(
+                tl.load(gumbel_seeds + row_batch),
+                tl.load(gumbel_positions + row_batch) + parent_depth, token_ids)
+        else:
+            selection_scores = raw_scores
         parent_active = (tl.load(valid_ptr + program) != 0) & (parent_depth < DEPTH)
         frontier_batch = program // WIDTH
         frontier_row = program - frontier_batch * WIDTH
@@ -392,6 +405,8 @@ def _uzu_publish_frontier_kernel(
             top_value = tl.load(logits_ptr + program * POOL_SIZE + top_index).to(
                 tl.float32
             )
+            if SHARED_GUMBEL:
+                top_value = top_value / tl.load(gumbel_temperatures + program // WIDTH)
             child_token = tl.load(candidate_ids_ptr + program * POOL_SIZE + top_index)
             child_valid = (
                 parent_active
@@ -521,6 +536,7 @@ def build_uzu_tree(
     token_embed: torch.Tensor,
 ) -> WeaverTree:
     bs, depth, pool_size = candidate_ids.shape
+    coupling = self._gumbel_tree_inputs[bs] if self.use_gumbel_sampling else (None,) * 4
     node_budget = int(self.tree_budget)
     final_num_nodes = node_budget + 1
     batch_expand_width = int(self.tree_parents_per_round)
@@ -651,6 +667,8 @@ def build_uzu_tree(
             frontier_logprobs,
             frontier_active,
             int(slot_start),
+            *coupling,
+            SHARED_GUMBEL=self.use_gumbel_sampling,
             BS=int(bs),
             WIDTH=int(width),
             DEPTH=int(depth),

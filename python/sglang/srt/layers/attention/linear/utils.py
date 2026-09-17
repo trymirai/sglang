@@ -97,7 +97,10 @@ def gdn_dflash_tfm_tree_verify_enabled(server_args: ServerArgs) -> bool:
         return False
     num_draft_tokens = server_args.speculative_num_draft_tokens or 0
     block_size = server_args.speculative_dflash_block_size or 0
-    return block_size > 0 and num_draft_tokens > block_size
+    return block_size > 0 and num_draft_tokens > 0 and (
+        num_draft_tokens > block_size
+        or server_args.speculative_dflash_tfm_proposal == "weaver_uzu"
+    )
 
 
 def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:

@@ -77,8 +77,15 @@ class SamplingBatchInfo:
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
         enable_deterministic = global_server_args.enable_deterministic_inference
+        use_gumbel_sampling = (
+            global_server_args.speculative_sampling_coupling == "shared_gumbel"
+        )
 
         reqs = batch.reqs
+        if use_gumbel_sampling and any(
+            r.sampling_params.sampling_seed is None for r in reqs
+        ):
+            raise ValueError("shared_gumbel requires an explicit sampling_seed per request")
         device = batch.device
         _pin = is_pin_memory_available(device)
         temperatures = (
@@ -118,7 +125,7 @@ class SamplingBatchInfo:
                 dtype=torch.int64,
                 pin_memory=_pin,
             ).to(device, non_blocking=True)
-            if enable_deterministic
+            if enable_deterministic or use_gumbel_sampling
             else None
         )
 

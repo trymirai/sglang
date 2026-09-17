@@ -80,6 +80,9 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.use_gumbel_sampling = (
+            get_global_server_args().speculative_sampling_coupling == "shared_gumbel"
+        )
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -130,6 +133,16 @@ class Sampler(nn.Module):
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
                 )
+        elif self.use_gumbel_sampling:
+            from sglang.srt.speculative.shared_gumbel import filtered_probs, sample_probs
+
+            probs = filtered_probs(logits, sampling_info)
+            batch_next_token_ids = sample_probs(
+                probs, sampling_info.sampling_seed, positions
+            )
+            if return_logprob:
+                logprobs = torch.log(probs)
+                original_logprobs = torch.log_softmax(logits, dim=-1)
         else:
             simple_sampling_case = (
                 not sampling_info.need_top_p_sampling

@@ -339,14 +339,12 @@ def create_dummy_verify_input(
                 seq_lens_cpu=None,
             )
     elif spec_algorithm.is_dflash():
+        from sglang.srt.layers.attention.linear.utils import (
+            gdn_dflash_tfm_tree_verify_enabled,
+        )
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
-        is_tfm_tree = (
-            hasattr(spec_algorithm, "is_dflash_tfm")
-            and spec_algorithm.is_dflash_tfm()
-            and server_args.speculative_num_draft_tokens
-            != server_args.speculative_dflash_block_size
-        )
+        is_tfm_tree = gdn_dflash_tfm_tree_verify_enabled(server_args)
         use_tree_metadata = is_tfm_tree and not is_draft_worker
         if device is None:
             device = custom_mask.device

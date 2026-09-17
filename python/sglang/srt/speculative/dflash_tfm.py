@@ -2524,6 +2524,14 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             sequential=sequential_filters,
         )
         target_probs = target_probs.view(bs, self.draft_token_num, -1)
+        if server_args.speculative_sampling_coupling == "shared_gumbel":
+            from sglang.srt.speculative.shared_gumbel import sample_probs
+
+            seeds = sampling_info.sampling_seed.repeat_interleave(self.draft_token_num)
+            target_predict = sample_probs(
+                target_probs.flatten(0, 1), seeds, self.positions.reshape(-1)
+            ).view(bs, self.draft_token_num)
+            return self._verify_from_target_predict(target_predict, bs)
         random_count = (
             self.draft_token_num + 1
             if self.tree_sampling_mode == "target_only"
@@ -2696,6 +2704,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
 
     def __init__(self, *args, **kwargs):
         server_args = args[0] if args else kwargs["server_args"]
+        self.use_gumbel_sampling = (
+            server_args.speculative_sampling_coupling == "shared_gumbel"
+        )
         target_verify_tokens = server_args.speculative_num_draft_tokens
         if target_verify_tokens is None:
             target_verify_tokens = (
@@ -4236,6 +4247,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
         depth = self.block_size - 1 if self.use_ddtree else min(self.block_size - 1, self.weaver.K)
         proposal_features = draft_hidden[:, 1 : 1 + depth].contiguous()
+        if self.use_gumbel_sampling:
+            from sglang.srt.speculative.shared_gumbel import update_tree_context
+
+            update_tree_context(self, batch.sampling_info, prefix_lens)
         scores, ids = self._topk_from_lm_head(
             proposal_features.reshape(bs * depth, proposal_features.shape[-1]),
             lm_head,
