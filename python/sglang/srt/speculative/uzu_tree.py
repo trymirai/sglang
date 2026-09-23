@@ -1,8 +1,28 @@
 """Uzu-style grow-and-prune tree with deterministic or shared-Gumbel Top-C.
 
-Gumbel noise affects child selection only. Frontier priority and final pruning
-use unperturbed cumulative log probabilities. Weaver inference and verification
-remain in dflash_tfm.
+Child selection is always driven by the shared Gumbel field when it is enabled.
+The edge weight, and therefore frontier priority and final pruning, is noise-free
+only at --speculative-dflash-tfm-uzu-weight-sigma inf (the default); a finite sigma
+mixes the same field into the weight as softmax(logits / T + G / sigma).
+
+The drafter is also calibrated independently of the verifier: --...-uzu-draft-temperature
+replaces the request temperature in the score above, --...-uzu-weight-temperature gives the edge
+weight a temperature of its own while children are still selected at the draft temperature, and
+--...-uzu-draft-top-k/-top-p/-min-p (their nucleus taken at the verifier's temperature)
+truncate the drafter's pool distribution before the tree is scored. Truncated candidates are
+masked to -inf, so they leave Top-C selection and the edge-weight normaliser together and the
+edge stays a log-softmax of one consistent vector.
+
+--...-uzu-prune-sigma gives the final prune a node score of its own: the same edge weight
+with the field at 1 / sigma_prune, accumulated along the path. Frontier priority keeps the score
+built with --...-uzu-weight-sigma. Without it there is one score for both, as before.
+
+A finite sigma, a draft temperature and draft filtering all change node scores and draft log
+probabilities, which is safe only because shared_gumbel requires target_only verification, and
+target_only never reads draft_logprobs (only the traversal path does). They therefore alter tree
+topology, never the distribution of accepted tokens.
+
+Weaver inference and verification remain in dflash_tfm.
 """
 
 from __future__ import annotations
@@ -80,6 +100,9 @@ def _uzu_materialize_frontier_kernel(
     selected_scores_ptr,
     selected_active_ptr,
     selected_parent_ancestors_ptr,
+    frontier_prune_scores_ptr,
+    node_prune_scores_ptr,
+    selected_prune_scores_ptr,
     slot_start,
     NUM_NODES: tl.constexpr,
     DEPTH: tl.constexpr,
@@ -91,6 +114,7 @@ def _uzu_materialize_frontier_kernel(
     BLOCK_FRONTIER: tl.constexpr,
     FRONTIER_LIMIT: tl.constexpr,
     WRITE_ANCESTORS: tl.constexpr,
+    SEPARATE_PRUNE: tl.constexpr,
 ):
     batch = tl.program_id(0)
     selected_offset = tl.arange(0, 32)
@@ -242,6 +266,22 @@ def _uzu_materialize_frontier_kernel(
         tl.where(valid, score, -float("inf")),
         mask=selected_mask,
     )
+    if SEPARATE_PRUNE:
+        # The prune score travels with the node: into its tree slot for the final prune, and
+        # into the scratch row as the parent prune score of its own children.
+        prune_score = tl.load(
+            frontier_prune_scores_ptr + selected_index, mask=selected_mask, other=0.0
+        ).to(tl.float32)
+        tl.store(
+            node_prune_scores_ptr + output_index,
+            tl.where(valid, prune_score, -float("inf")),
+            mask=selected_mask,
+        )
+        tl.store(
+            selected_prune_scores_ptr + scratch_index,
+            tl.where(valid, prune_score, -float("inf")),
+            mask=selected_mask,
+        )
     tl.store(
         selected_active_ptr + scratch_index,
         valid & (depth < effective_max_depth),
@@ -284,12 +324,14 @@ def _uzu_publish_frontier_kernel(
     logits_ptr,
     candidate_ids_ptr,
     prefix_score_ptr,
+    prefix_prune_score_ptr,
     valid_ptr,
     node_depth_ptr,
     frontier_tokens_ptr,
     frontier_parents_ptr,
     frontier_depths_ptr,
     frontier_scores_ptr,
+    frontier_prune_scores_ptr,
     frontier_logprobs_ptr,
     frontier_active_ptr,
     slot_start,
@@ -297,7 +339,11 @@ def _uzu_publish_frontier_kernel(
     gumbel_positions,
     gumbel_temperatures,
     gumbel_scale,
+    gumbel_weight_scale,
+    gumbel_weight_temperatures,
+    gumbel_prune_scale,
     SHARED_GUMBEL: tl.constexpr,
+    SEPARATE_PRUNE: tl.constexpr,
     BS: tl.constexpr,
     WIDTH: tl.constexpr,
     DEPTH: tl.constexpr,
@@ -377,20 +423,50 @@ def _uzu_publish_frontier_kernel(
         parent_depth = tl.load(node_depth_ptr + program)
         if SHARED_GUMBEL:
             row_batch = program // WIDTH
-            raw_scores = raw_scores / tl.load(gumbel_temperatures + row_batch)
-            selection_scores = raw_scores + tl.load(gumbel_scale) * gumbel_at(
+            valid_slot = (token_ids >= 0) & pool_mask
+            # Selection and weight divide by temperatures of their own. The weight temperature
+            # defaults to a copy of the selection one, and then the two quotients are bitwise
+            # equal, so the tree is exactly what a single shared temperature gave.
+            # Each quotient is re-masked after the division: an infinite temperature turns the
+            # -inf of a padded or token-less slot into NaN, which would then win a max and
+            # corrupt the tree. For any finite temperature this is an exact no-op.
+            selection_logits = tl.where(
+                valid_slot, raw_scores / tl.load(gumbel_temperatures + row_batch),
+                -float("inf"),
+            )
+            weight_logits = tl.where(
+                valid_slot, raw_scores / tl.load(gumbel_weight_temperatures + row_batch),
+                -float("inf"),
+            )
+            noise = gumbel_at(
                 tl.load(gumbel_seeds + row_batch),
                 tl.load(gumbel_positions + row_batch) + parent_depth, token_ids)
+            selection_scores = selection_logits + tl.load(gumbel_scale) * noise
+            # The weight sees the same field scaled by 1 / sigma. At sigma = inf the scale is
+            # 0.0 and this is an exact no-op, so the edge weight stays what it is today.
+            weight_scores = weight_logits + tl.load(gumbel_weight_scale) * noise
+            if SEPARATE_PRUNE:
+                # The prune score sees the same field scaled by 1 / sigma_prune. Only the final
+                # prune reads it; frontier priority keeps the sigma score above.
+                prune_scores = weight_logits + tl.load(gumbel_prune_scale) * noise
         else:
             selection_scores = raw_scores
+            weight_scores = raw_scores
         parent_active = (tl.load(valid_ptr + program) != 0) & (parent_depth < DEPTH)
         frontier_batch = program // WIDTH
         frontier_row = program - frontier_batch * WIDTH
-        max_score = tl.max(raw_scores, axis=0)
+        max_score = tl.max(weight_scores, axis=0)
         exp_scores = tl.where(
-            raw_scores == -float("inf"), 0.0, tl.exp(raw_scores - max_score)
+            weight_scores == -float("inf"), 0.0, tl.exp(weight_scores - max_score)
         )
         log_denom = tl.log(tl.sum(exp_scores, axis=0)) + max_score
+        if SEPARATE_PRUNE:
+            prune_max = tl.max(prune_scores, axis=0)
+            prune_exp = tl.where(
+                prune_scores == -float("inf"), 0.0, tl.exp(prune_scores - prune_max)
+            )
+            prune_log_denom = tl.log(tl.sum(prune_exp, axis=0)) + prune_max
+            parent_prune_score = tl.load(prefix_prune_score_ptr + program)
         child_base = (
             frontier_batch * FRONTIER_SLOTS + (slot_start + frontier_row) * EXPAND_WIDTH
         )
@@ -402,11 +478,11 @@ def _uzu_publish_frontier_kernel(
                 return_indices=True,
                 return_indices_tie_break_left=True,
             )
-            top_value = tl.load(logits_ptr + program * POOL_SIZE + top_index).to(
-                tl.float32
+            # Gather from the same vector the normalizer came from, so the edge stays a
+            # log-softmax of one consistent score vector (temperature already applied there).
+            top_value = tl.sum(
+                tl.where(candidate_offsets == top_index, weight_scores, 0.0), axis=0
             )
-            if SHARED_GUMBEL:
-                top_value = top_value / tl.load(gumbel_temperatures + program // WIDTH)
             child_token = tl.load(candidate_ids_ptr + program * POOL_SIZE + top_index)
             child_valid = (
                 parent_active
@@ -444,6 +520,19 @@ def _uzu_publish_frontier_kernel(
                 frontier_logprobs_ptr + child_index,
                 tl.where(child_valid, edge_logprob, -float("inf")),
             )
+            if SEPARATE_PRUNE:
+                # Same child, same monotone accumulation, the other weight vector.
+                prune_value = tl.sum(
+                    tl.where(candidate_offsets == top_index, prune_scores, 0.0), axis=0
+                )
+                prune_edge = tl.minimum(prune_value - prune_log_denom, 0.0)
+                prune_child = tl.minimum(
+                    parent_prune_score, parent_prune_score + prune_edge
+                )
+                tl.store(
+                    frontier_prune_scores_ptr + child_index,
+                    tl.where(child_valid, prune_child, -float("inf")),
+                )
             tl.store(frontier_active_ptr + child_index, child_valid)
             selection_scores = tl.where(
                 candidate_offsets == top_index,
@@ -524,6 +613,76 @@ def _weaver_prune_constructed_tree(
     )
 
 
+def _filter_draft_logits(
+    logits: torch.Tensor,
+    row_candidate_ids: torch.Tensor,
+    temperatures: torch.Tensor | None,
+    width: int,
+    top_k: int,
+    top_p: float,
+    min_p: float,
+) -> torch.Tensor:
+    """Truncate the drafter's pool distribution, independently of the verifier's.
+
+    The probabilities are taken at the VERIFIER's temperature over the candidate pool the
+    drafter actually scores, so a nucleus here is a share of the pool mass and not of the
+    vocabulary. The verifier temperature, not the selection one, because the nucleus stands in
+    for the verifier's own, which no drafter knob moves. Nothing is lost by that: children are
+    a Top-C, which sees only the order of f(l)/T_sel + G, and that order equals the order of
+    f(l) + T_sel * G, so the selection temperature acts as a scale on the Gumbel noise and never
+    needs tempered logits. Filtering happens after the temperature, matching the order the
+    verifier's own path uses.
+
+    Dropped candidates are masked to -inf, which removes them from Top-C selection and from the
+    edge-weight normaliser at once; the kernel already treats -inf as "not a child". One
+    descending sort serves all three filters.
+
+    The filters chain rather than intersect: top-k first, then top-p over the probabilities
+    renormalised on the top-k survivors, then min-p over what is left. This is what
+    apply_dflash_draft_truncation does on the DFLASH chain path, and what the verifier's own
+    top_k_renorm_prob / top_p_renorm_prob do. Intersecting three thresholds taken on one
+    full-pool softmax would keep strictly more candidates and give the same flags a second
+    meaning.
+    """
+    if top_k == 0 and top_p >= 1.0 and min_p <= 0.0:
+        return logits
+    if temperatures is None:
+        raise RuntimeError(
+            "Draft-side filtering needs the shared Gumbel context for the draft temperature."
+        )
+    # Pool slots without a token carry meaningless logits and must not occupy a top-k slot or
+    # eat nucleus mass; the kernel masks them the same way.
+    logits = logits.masked_fill(row_candidate_ids < 0, -float("inf"))
+    sorted_logits, order = logits.sort(dim=-1, descending=True)
+    # Rows are batch-major, width rows per request, matching the kernel's program // WIDTH.
+    row_temperatures = temperatures.repeat_interleave(width).unsqueeze(-1)
+    tempered = sorted_logits / row_temperatures
+    positions = torch.arange(logits.shape[-1], device=logits.device)
+    keep = torch.ones_like(tempered, dtype=torch.bool)
+
+    def survivor_probs() -> torch.Tensor:
+        """Distribution over the candidates still alive, so each stage sees the previous one."""
+        return torch.softmax(
+            torch.where(keep, tempered, torch.full_like(tempered, -float("inf"))), dim=-1
+        )
+
+    if top_k > 0:
+        keep &= positions < top_k
+    if top_p < 1.0:
+        probs = survivor_probs()
+        # Keep every candidate whose predecessors have not yet covered top_p, so the candidate
+        # that crosses the threshold survives and the kept mass is at least top_p.
+        keep &= (probs.cumsum(-1) - probs) < top_p
+    if min_p > 0.0:
+        probs = survivor_probs()
+        # Position 0 always survives the stages above, so its probability is the surviving max.
+        keep &= probs >= min_p * probs[:, :1]
+    # The most likely candidate always survives, whatever the thresholds say.
+    keep |= positions == 0
+    mask = torch.zeros_like(keep).scatter_(-1, order, keep)
+    return logits.masked_fill(~mask, -float("inf"))
+
+
 def build_uzu_tree(
     self,
     *,
@@ -536,7 +695,11 @@ def build_uzu_tree(
     token_embed: torch.Tensor,
 ) -> WeaverTree:
     bs, depth, pool_size = candidate_ids.shape
-    coupling = self._gumbel_tree_inputs[bs] if self.use_gumbel_sampling else (None,) * 4
+    coupling = self._gumbel_tree_inputs[bs] if self.use_gumbel_sampling else (None,) * 7
+    separate_prune = self.use_gumbel_sampling and self.gumbel_prune_sigma_inv is not None
+    filter_temperatures = (
+        self._draft_filter_temperatures[bs] if self.use_gumbel_sampling else None
+    )
     node_budget = int(self.tree_budget)
     final_num_nodes = node_budget + 1
     batch_expand_width = int(self.tree_parents_per_round)
@@ -615,6 +778,18 @@ def build_uzu_tree(
         dtype=torch.long,
         device=device,
     )
+    # Prune scores: a second cumulative score with the field at 1 / sigma_prune, read only by the
+    # final prune. Without sigma_prune these are the very score tensors, the kernels never touch
+    # them, and the prune is exactly the one before this knob existed.
+    if separate_prune:
+        node_prune_scores = torch.full_like(node_scores, -torch.inf)
+        node_prune_scores[:, 0] = 0.0
+        frontier_prune_scores = torch.full_like(frontier_scores, -torch.inf)
+        selected_prune_scores = torch.empty_like(selected_scores)
+    else:
+        node_prune_scores = node_scores
+        frontier_prune_scores = frontier_scores
+        selected_prune_scores = selected_scores
     if device.type != "cuda":
         raise RuntimeError("Weaver tree construction requires Triton on CUDA.")
 
@@ -625,11 +800,21 @@ def build_uzu_tree(
         current_values: torch.Tensor,
         parent_ancestors: torch.Tensor,
         prefix_score: torch.Tensor,
+        prefix_prune_score: torch.Tensor,
         valid: torch.Tensor,
         node_depth: torch.Tensor,
         slot_start: int,
         width: int,
     ) -> None:
+        logits = _filter_draft_logits(
+            logits,
+            row_candidate_ids,
+            filter_temperatures,
+            width,
+            self.draft_top_k,
+            self.draft_top_p,
+            self.draft_min_p,
+        )
         # Keep children at tree_max_depth, but never expand them further.
         # Applying the cap before publishing leaves the fixed node budget
         # available to other, shallower frontier branches.
@@ -658,17 +843,20 @@ def build_uzu_tree(
             logits,
             row_candidate_ids,
             prefix_score,
+            prefix_prune_score,
             valid,
             node_depth,
             frontier_tokens,
             frontier_parents,
             frontier_depths,
             frontier_scores,
+            frontier_prune_scores,
             frontier_logprobs,
             frontier_active,
             int(slot_start),
             *coupling,
             SHARED_GUMBEL=self.use_gumbel_sampling,
+            SEPARATE_PRUNE=separate_prune,
             BS=int(bs),
             WIDTH=int(width),
             DEPTH=int(depth),
@@ -709,6 +897,9 @@ def build_uzu_tree(
             selected_scores,
             selected_active,
             selected_parent_ancestors,
+            frontier_prune_scores,
+            node_prune_scores,
+            selected_prune_scores,
             int(slot_start),
             NUM_NODES=int(num_nodes),
             DEPTH=int(depth),
@@ -724,6 +915,7 @@ def build_uzu_tree(
             # prune.  Every construction slot still needs its ancestor
             # chain for subsequent Weaver rounds.
             WRITE_ANCESTORS=slot_start + width <= num_nodes,
+            SEPARATE_PRUNE=separate_prune,
             num_warps=1,
         )
 
@@ -792,6 +984,7 @@ def build_uzu_tree(
         root_values,
         root_parent_ancestors,
         root_prefix_score,
+        root_prefix_score,
         root_active[:, None],
         root_depth[:, None],
         0,
@@ -813,6 +1006,7 @@ def build_uzu_tree(
 
         token_flat = token.reshape(bs * width)
         node_score_flat = node_score.reshape(bs * width)
+        node_prune_score_flat = selected_prune_scores[:, :width].reshape(bs * width)
         node_depth_flat = node_depth.reshape(bs * width)
         valid_flat = valid.reshape(bs * width)
         position_ids_flat = position_ids.reshape(bs * width)
@@ -838,6 +1032,7 @@ def build_uzu_tree(
             current_values,
             parent_ancestors,
             node_score_flat,
+            node_prune_score_flat,
             valid_flat,
             node_depth_flat,
             slot_start,
@@ -849,12 +1044,12 @@ def build_uzu_tree(
         node_depths=depths,
         node_mask=node_mask,
         node_logprobs=draft_logprobs,
-        node_scores=node_scores,
+        node_scores=node_prune_scores,
         frontier_tokens=frontier_tokens,
         frontier_parents=frontier_parents,
         frontier_depths=frontier_depths,
         frontier_active=frontier_active,
         frontier_logprobs=frontier_logprobs,
-        frontier_scores=frontier_scores,
+        frontier_scores=frontier_prune_scores,
         final_num_nodes=final_num_nodes,
     )

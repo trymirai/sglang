@@ -590,7 +590,9 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    # shared_gumbel requires an explicit seed on every request, and this health
+    # probe is a real generation, so without a seed it kills the scheduler.
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.0, "sampling_seed": 0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -2015,6 +2017,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         "sampling_params": {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
+            # shared_gumbel rejects any request without an explicit seed, including
+            # this internal warmup, so the server would die before becoming ready.
+            "sampling_seed": 0,
         },
     }
     if server_args.skip_tokenizer_init:
@@ -2051,6 +2056,10 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_tokens": max_new_tokens,
             "stream": False,
             "temperature": 0.0,
+            # This VLM branch is the path actually taken by models that advertise
+            # image understanding. ChatCompletionRequest.seed maps to sampling_seed,
+            # which shared_gumbel requires on every request, warmup included.
+            "seed": 0,
         }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
@@ -2088,6 +2097,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                     "temperature": 0.0,
                     "max_new_tokens": 8,
                     "ignore_eos": True,
+                    # Same reason as the warmup above: shared_gumbel needs a seed.
+                    "sampling_seed": 0,
                 },
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup

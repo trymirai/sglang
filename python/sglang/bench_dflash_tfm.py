@@ -656,8 +656,8 @@ def _one_request(args, name, index, total, qid, text):
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
         "top_p": args.top_p,
-        "top_k": -1,
-        "min_p": 0.0,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
         "frequency_penalty": 0.0,
         "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
@@ -845,6 +845,12 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=["mtbench"])
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    # Verifier-side truncation. The defaults (-1 / 0.0) keep sampling unfiltered, as before.
+    # With any of these set the sampler leaves its simple case, and the flashinfer backend then
+    # refuses an explicit sampling_seed, which shared_gumbel requires: serve with
+    # --sampling-backend pytorch for that combination.
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--tokenizer-path", help="Render the target model's native chat template.")
     parser.add_argument("--server-rng", action="store_true", help="Use the fixed server seed; required by FlashInfer top-p sampling.")
     parser.add_argument("--dataset-dir", type=Path, help="Frozen question JSON files, already shuffled and subsampled.")

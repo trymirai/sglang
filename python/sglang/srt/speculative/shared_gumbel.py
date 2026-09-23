@@ -21,13 +21,47 @@ def update_tree_context(worker, sampling_info, prefix_positions):
             torch.empty_like(prefix_positions),
             torch.empty_like(sampling_info.temperatures.reshape(-1)),
             torch.empty((), device=prefix_positions.device),
+            torch.empty((), device=prefix_positions.device),
+            torch.empty_like(sampling_info.temperatures.reshape(-1)),
+            torch.empty((), device=prefix_positions.device),
         )
-    seeds, positions, temperatures, noise_scale = worker._gumbel_tree_inputs[bs]
+    (seeds, positions, temperatures, noise_scale, weight_scale, weight_temperatures,
+     prune_scale) = worker._gumbel_tree_inputs[bs]
     seeds.copy_(sampling_info.sampling_seed)
     positions.copy_(prefix_positions)
-    temperatures.copy_(sampling_info.temperatures.reshape(-1))
-    noise_scale.fill_(0.0 if sampling_info.is_all_greedy else 1.0)
-    return seeds, positions, temperatures, noise_scale
+    # The drafter's top-k/top-p nucleus is taken at the VERIFIER's temperature: it stands in for
+    # the verifier's own nucleus, which no drafter knob moves. Kept apart from the kernel inputs,
+    # and like them persistent per batch size so CUDA Graph replay sees the refreshed values.
+    if not hasattr(worker, "_draft_filter_temperatures"):
+        worker._draft_filter_temperatures = {}
+    if bs not in worker._draft_filter_temperatures:
+        worker._draft_filter_temperatures[bs] = torch.empty_like(
+            sampling_info.temperatures.reshape(-1)
+        )
+    worker._draft_filter_temperatures[bs].copy_(sampling_info.temperatures.reshape(-1))
+    # This tensor feeds only the tree kernel's score division, never target sampling, so the
+    # drafter's temperature can be set independently of the verifier's.
+    if worker.draft_temperature is None:
+        temperatures.copy_(sampling_info.temperatures.reshape(-1))
+    else:
+        temperatures.fill_(worker.draft_temperature)
+    # The edge weight has its own temperature. By default it is a copy of the selection one, so
+    # both quotients in the kernel are bitwise equal and the tree is unchanged.
+    if worker.weight_temperature is None:
+        weight_temperatures.copy_(temperatures)
+    else:
+        weight_temperatures.fill_(worker.weight_temperature)
+    scale = 0.0 if sampling_info.is_all_greedy else 1.0
+    noise_scale.fill_(scale)
+    # Greedy batches carry no noise at all, so the weight stays noise-free there whatever
+    # sigma is; otherwise the weight sees the same field scaled by 1 / sigma.
+    weight_scale.fill_(scale * worker.gumbel_weight_sigma_inv)
+    # The prune-only score sees the same field scaled by 1 / sigma_prune. Unused (and zero) when
+    # no sigma_prune is set: the kernel then keeps a single score.
+    prune_sigma_inv = worker.gumbel_prune_sigma_inv
+    prune_scale.fill_(0.0 if prune_sigma_inv is None else scale * prune_sigma_inv)
+    return (seeds, positions, temperatures, noise_scale, weight_scale, weight_temperatures,
+            prune_scale)
 
 
 @triton.jit

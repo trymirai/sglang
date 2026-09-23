@@ -2707,6 +2707,30 @@ class DFlashTfmWorker(DFlashWorkerV2):
         self.use_gumbel_sampling = (
             server_args.speculative_sampling_coupling == "shared_gumbel"
         )
+        # Reciprocal of the edge-weight sigma, applied to the shared Gumbel field when the
+        # tree weight is built. 1 / inf is exactly 0.0, so the default leaves the weight
+        # bit-identical to the noise-free one.
+        self.gumbel_weight_sigma_inv = (
+            1.0 / server_args.speculative_dflash_tfm_uzu_weight_sigma
+        )
+        # Reciprocal sigma of the prune-only node score. None keeps a single score, so the final
+        # prune reads the frontier score exactly as before this knob existed.
+        prune_sigma = server_args.speculative_dflash_tfm_uzu_prune_sigma
+        self.gumbel_prune_sigma_inv = None if prune_sigma is None else 1.0 / prune_sigma
+        # Drafter-side calibration, read once and independent of the verifier's sampling
+        # parameters. The defaults (None / 0 / 1.0 / 0.0) mean "follow the request, filter
+        # nothing" and leave the proposal bit-identical to the untouched path.
+        self.draft_temperature = (
+            server_args.speculative_dflash_tfm_uzu_draft_temperature
+        )
+        self.draft_top_k = server_args.speculative_dflash_tfm_uzu_draft_top_k
+        self.draft_top_p = server_args.speculative_dflash_tfm_uzu_draft_top_p
+        self.draft_min_p = server_args.speculative_dflash_tfm_uzu_draft_min_p
+        # Edge-weight temperature, decoupled from the selection one. None keeps it equal to the
+        # selection temperature, which is the untouched behaviour.
+        self.weight_temperature = (
+            server_args.speculative_dflash_tfm_uzu_weight_temperature
+        )
         target_verify_tokens = server_args.speculative_num_draft_tokens
         if target_verify_tokens is None:
             target_verify_tokens = (

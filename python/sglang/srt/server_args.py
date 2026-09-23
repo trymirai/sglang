@@ -1557,6 +1557,55 @@ class ServerArgs:
         Optional[int],
         "weaver_uzu only. Maximum non-root depth. Defaults to min(DFlash block size - 1, Weaver checkpoint K).",
     ] = None
+    speculative_dflash_tfm_uzu_weight_sigma: A[
+        float,
+        "weaver_uzu with shared_gumbel only. Divides the shared Gumbel field inside the EDGE WEIGHT: "
+        "softmax(logits / temperature + G / sigma). Child selection is untouched. inf reproduces the current "
+        "noise-free weight exactly; 1 makes the weight the log-softmax of the very score children "
+        "are selected by; values in between interpolate. Negative sigma anti-correlates weight with "
+        "selection, penalising exactly the children the noise lifted, which probes whether the "
+        "selection winner is over-credited. Zero is rejected (infinite noise).",
+    ] = float("inf")
+    speculative_dflash_tfm_uzu_prune_sigma: A[
+        Optional[float],
+        "weaver_uzu with shared_gumbel only. Sigma of a SECOND node score that only the final prune "
+        "reads: softmax(logits / T_w + G / sigma_prune) accumulated along the path. None prunes by "
+        "the frontier score itself (the one --speculative-dflash-tfm-uzu-weight-sigma builds), which "
+        "is the current behaviour; inf prunes by the noise-free score. Frontier priority always "
+        "uses --speculative-dflash-tfm-uzu-weight-sigma.",
+    ] = None
+    speculative_dflash_tfm_uzu_draft_temperature: A[
+        Optional[float],
+        "weaver_uzu with shared_gumbel only. Temperature the DRAFTER is scored at, decoupled from "
+        "the verifier's. None follows the request temperature, which is the current behaviour. It "
+        "divides the pool logits before the shared Gumbel field is added, so it moves both Top-C "
+        "child selection and the edge weight; it never touches target sampling.",
+    ] = None
+    speculative_dflash_tfm_uzu_weight_temperature: A[
+        Optional[float],
+        "weaver_uzu with shared_gumbel only. Temperature of the EDGE WEIGHT alone, decoupled from the "
+        "temperature children are selected with. None keeps it equal to the selection temperature "
+        "(--speculative-dflash-tfm-uzu-draft-temperature, else the request's), which is the current "
+        "behaviour. It sets how sharp the edge weights are, hence frontier priority and pruning; it "
+        "never changes which children a parent proposes.",
+    ] = None
+    speculative_dflash_tfm_uzu_draft_top_k: A[
+        int,
+        "weaver_uzu with shared_gumbel only. Keep only the drafter's top-k pool candidates, "
+        "independently of the verifier's top_k. 0 disables it. Dropped candidates leave both Top-C "
+        "selection and the edge-weight normaliser.",
+    ] = 0
+    speculative_dflash_tfm_uzu_draft_top_p: A[
+        float,
+        "weaver_uzu with shared_gumbel only. Nucleus kept from the drafter's distribution at the "
+        "draft temperature, independently of the verifier's top_p. 1.0 disables it. The mass is "
+        "measured over the candidate pool the drafter scores, not the full vocabulary.",
+    ] = 1.0
+    speculative_dflash_tfm_uzu_draft_min_p: A[
+        float,
+        "weaver_uzu with shared_gumbel only. Drop drafter candidates whose pool probability falls "
+        "below min_p times the most likely one. 0.0 disables it.",
+    ] = 0.0
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
@@ -6935,6 +6984,91 @@ class ServerArgs:
                     "shared_gumbel supports AR or DFLASH_TFM with weaver_uzu, "
                     "target_only verification, and TP=1."
                 )
+        weight_sigma = self.speculative_dflash_tfm_uzu_weight_sigma
+        if math.isnan(weight_sigma) or weight_sigma == 0.0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-weight-sigma must be non-zero; "
+                "inf leaves the edge weight noise-free, and zero would mean infinite noise."
+            )
+        if math.isfinite(weight_sigma) and not (
+            self.speculative_sampling_coupling == "shared_gumbel"
+            and self.speculative_algorithm == "DFLASH_TFM"
+            and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+        ):
+            raise ValueError(
+                "A finite --speculative-dflash-tfm-uzu-weight-sigma requires "
+                "--speculative-sampling-coupling shared_gumbel together with "
+                "--speculative-algorithm DFLASH_TFM and "
+                "--speculative-dflash-tfm-proposal weaver_uzu. Anywhere else there is no "
+                "shared Gumbel field in the tree weight and sigma would be a silent no-op."
+            )
+        prune_sigma = self.speculative_dflash_tfm_uzu_prune_sigma
+        if prune_sigma is not None:
+            if math.isnan(prune_sigma) or prune_sigma == 0.0:
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-prune-sigma must be non-zero; "
+                    "inf prunes by the noise-free score, omitting it prunes by the frontier score."
+                )
+            if not (
+                self.speculative_sampling_coupling == "shared_gumbel"
+                and self.speculative_algorithm == "DFLASH_TFM"
+                and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+            ):
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-prune-sigma requires "
+                    "--speculative-sampling-coupling shared_gumbel together with "
+                    "--speculative-algorithm DFLASH_TFM and "
+                    "--speculative-dflash-tfm-proposal weaver_uzu; elsewhere there is no shared "
+                    "Gumbel field in the tree score and it would be a silent no-op."
+                )
+        draft_temperature = self.speculative_dflash_tfm_uzu_draft_temperature
+        weight_temperature = self.speculative_dflash_tfm_uzu_weight_temperature
+        draft_top_k = self.speculative_dflash_tfm_uzu_draft_top_k
+        draft_top_p = self.speculative_dflash_tfm_uzu_draft_top_p
+        draft_min_p = self.speculative_dflash_tfm_uzu_draft_min_p
+        if draft_temperature is not None and not draft_temperature > 0.0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-draft-temperature must be positive; "
+                "omit it to follow the verifier's temperature."
+            )
+        if weight_temperature is not None and not weight_temperature > 0.0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-weight-temperature must be positive; "
+                "omit it to keep the edge weight at the selection temperature."
+            )
+        if draft_top_k < 0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-draft-top-k must be non-negative; 0 disables it."
+            )
+        if not 0.0 < draft_top_p <= 1.0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-draft-top-p must be in (0, 1]; 1.0 disables it."
+            )
+        if not 0.0 <= draft_min_p < 1.0:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-draft-min-p must be in [0, 1); 0.0 disables it."
+            )
+        draft_calibration_set = (
+            draft_temperature is not None
+            or weight_temperature is not None
+            or draft_top_k != 0
+            or draft_top_p != 1.0
+            or draft_min_p != 0.0
+        )
+        if draft_calibration_set and not (
+            self.speculative_sampling_coupling == "shared_gumbel"
+            and self.speculative_algorithm == "DFLASH_TFM"
+            and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+        ):
+            raise ValueError(
+                "The drafter-side calibration flags "
+                "(--speculative-dflash-tfm-uzu-draft-temperature/-weight-temperature/"
+                "-draft-top-k/-top-p/-min-p) require "
+                "--speculative-sampling-coupling shared_gumbel together with "
+                "--speculative-algorithm DFLASH_TFM and "
+                "--speculative-dflash-tfm-proposal weaver_uzu. Anywhere else the tree is not "
+                "scored through that path and they would be a silent no-op."
+            )
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size
