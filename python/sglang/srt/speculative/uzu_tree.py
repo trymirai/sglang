@@ -27,6 +27,7 @@ Weaver inference and verification remain in dflash_tfm.
 
 from __future__ import annotations
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -34,6 +35,107 @@ import triton.language as tl
 # Loaded lazily by DFlashTfmWorker after dflash_tfm finishes importing.
 from sglang.srt.speculative.dflash_tfm import WeaverTree
 from sglang.srt.speculative.shared_gumbel import gumbel_at
+
+
+class UzuTreeShape(msgspec.Struct, frozen=True):
+    """How a tree grows: R expansion rounds, W parents per round, C children per parent."""
+
+    rounds: int
+    parents_per_round: int
+    children_per_parent: int
+
+    @classmethod
+    def from_worker(cls, worker) -> UzuTreeShape:
+        return cls(
+            worker.tree_rounds,
+            worker.tree_parents_per_round,
+            worker.tree_children_per_parent,
+        )
+
+    @classmethod
+    def parse(cls, spec: str) -> UzuTreeShape:
+        """Parse "RxWxC", e.g. "16x32x16"."""
+        parts = spec.strip().lower().split("x")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise ValueError(f"A tree shape must be RxWxC in positive integers, got {spec!r}.")
+        return cls(*(int(part) for part in parts))
+
+    @property
+    def num_slots(self) -> int:
+        """Construction slots: the root plus W parents in each of the R - 1 later rounds."""
+        return 1 + (self.rounds - 1) * self.parents_per_round
+
+    @property
+    def max_candidates(self) -> int:
+        """Nodes before the prune: the root plus C children of every construction slot."""
+        return 1 + self.children_per_parent * self.num_slots
+
+    def __str__(self) -> str:
+        return f"{self.rounds}x{self.parents_per_round}x{self.children_per_parent}"
+
+
+def check_uzu_tree_shape(shape: UzuTreeShape, candidate_pool_size: int, tree_budget: int) -> None:
+    """The limits configure_uzu_tree enforces on the served shape, for an extra (dump) shape."""
+    if shape.rounds < 1:
+        raise ValueError(f"Tree shape {shape}: R must be >= 1.")
+    if not 1 <= shape.parents_per_round <= 32:
+        raise ValueError(
+            f"Tree shape {shape}: W must be in 1..32 (the fused frontier kernel supports at "
+            "most 32 parents)."
+        )
+    if not 1 <= shape.children_per_parent <= candidate_pool_size:
+        raise ValueError(
+            f"Tree shape {shape}: C must be in 1..{candidate_pool_size} (the effective candidate "
+            "pool)."
+        )
+    if not 1 <= tree_budget < shape.max_candidates:
+        raise ValueError(
+            f"Tree shape {shape}: the tree budget {tree_budget} must be below its "
+            f"{shape.max_candidates} candidates, or pruning it would keep everything."
+        )
+
+
+class UzuConstructedTree(msgspec.Struct):
+    """A grown tree before the final prune: construction slots plus the still-active frontier.
+
+    Slots are in topological order and ``*_parents`` index slots. ``*_scores`` accumulate the
+    frontier-priority score, ``*_prune_scores`` the score the prune reads (the very same tensors
+    without --...-uzu-prune-sigma), and ``*_logprobs`` hold per-edge log weights.
+    """
+
+    node_tokens: torch.Tensor
+    node_parents: torch.Tensor
+    node_depths: torch.Tensor
+    node_mask: torch.Tensor
+    node_logprobs: torch.Tensor
+    node_scores: torch.Tensor
+    node_prune_scores: torch.Tensor
+    frontier_tokens: torch.Tensor
+    frontier_parents: torch.Tensor
+    frontier_depths: torch.Tensor
+    frontier_active: torch.Tensor
+    frontier_logprobs: torch.Tensor
+    frontier_scores: torch.Tensor
+    frontier_prune_scores: torch.Tensor
+
+    def prune(self, final_num_nodes: int) -> WeaverTree:
+        """Keep the top final_num_nodes nodes by prune score, as the served tree does."""
+        return _weaver_prune_constructed_tree(
+            node_tokens=self.node_tokens,
+            node_parents=self.node_parents,
+            node_depths=self.node_depths,
+            node_mask=self.node_mask,
+            node_logprobs=self.node_logprobs,
+            node_scores=self.node_prune_scores,
+            frontier_tokens=self.frontier_tokens,
+            frontier_parents=self.frontier_parents,
+            frontier_depths=self.frontier_depths,
+            frontier_active=self.frontier_active,
+            frontier_logprobs=self.frontier_logprobs,
+            frontier_scores=self.frontier_prune_scores,
+            final_num_nodes=final_num_nodes,
+        )
+
 
 def configure_uzu_tree(worker) -> None:
     args = worker.server_args
@@ -77,7 +179,11 @@ def configure_uzu_tree(worker) -> None:
         )
 
 
-@triton.jit
+# The frontier limit changes every round (slot_start * C). As a constexpr it compiled one variant
+# per round, which a 64-round diagnostic tree pays for in tens of minutes; as a runtime value, left
+# unspecialised, there is one variant per block size. It only bounds the frontier mask, an exact
+# integer compare, so the selection is the same either way.
+@triton.jit(do_not_specialize=["frontier_limit"])
 def _uzu_materialize_frontier_kernel(
     frontier_tokens_ptr,
     frontier_parents_ptr,
@@ -104,6 +210,7 @@ def _uzu_materialize_frontier_kernel(
     node_prune_scores_ptr,
     selected_prune_scores_ptr,
     slot_start,
+    frontier_limit,
     NUM_NODES: tl.constexpr,
     DEPTH: tl.constexpr,
     MAX_TREE_DEPTH: tl.constexpr,
@@ -112,7 +219,6 @@ def _uzu_materialize_frontier_kernel(
     SCRATCH_WIDTH: tl.constexpr,
     BLOCK_DEPTH: tl.constexpr,
     BLOCK_FRONTIER: tl.constexpr,
-    FRONTIER_LIMIT: tl.constexpr,
     WRITE_ANCESTORS: tl.constexpr,
     SEPARATE_PRUNE: tl.constexpr,
 ):
@@ -120,7 +226,7 @@ def _uzu_materialize_frontier_kernel(
     selected_offset = tl.arange(0, 32)
     selected_mask = selected_offset < SELECT_WIDTH
     frontier_offset = tl.arange(0, BLOCK_FRONTIER)
-    frontier_mask = frontier_offset < FRONTIER_LIMIT
+    frontier_mask = frontier_offset < frontier_limit
     frontier_scores = tl.load(
         frontier_scores_ptr + batch * FRONTIER_SLOTS + frontier_offset,
         mask=frontier_mask,
@@ -541,6 +647,18 @@ def _uzu_publish_frontier_kernel(
             )
 
 
+def _frontier_select_warps(block_frontier: int) -> int:
+    """Warps for the frontier select: one up to 1024 slots, then one per 1024 up to 16.
+
+    The select is a single program per request that unrolls SELECT_WIDTH exact integer
+    max/min reductions over the whole frontier block, so its result does not depend on the
+    warp count. One warp keeps the small served frontiers exactly as they were; a large
+    diagnostic frontier on one warp would hold a thousand elements per thread and take
+    minutes to compile and to run.
+    """
+    return 1 if block_frontier <= 1024 else min(16, block_frontier // 1024)
+
+
 def _tree_frontier_expandable(
     valid: torch.Tensor,
     node_depth: torch.Tensor,
@@ -694,17 +812,69 @@ def build_uzu_tree(
     proposal_features: torch.Tensor,
     token_embed: torch.Tensor,
 ) -> WeaverTree:
+    shape = UzuTreeShape.from_worker(self)
+    node_budget = int(self.tree_budget)
+    if node_budget <= 0 or candidate_ids.shape[1] <= 0:
+        return _root_only_tree(root_ids, shape.num_slots)
+    return construct_uzu_tree(
+        self,
+        root_ids=root_ids,
+        output_norm=output_norm,
+        candidate_ids=candidate_ids,
+        candidate_weights=candidate_weights,
+        candidate_scores=candidate_scores,
+        proposal_features=proposal_features,
+        token_embed=token_embed,
+        shape=shape,
+    ).prune(node_budget + 1)
+
+
+def _root_only_tree(root_ids: torch.Tensor, num_nodes: int) -> WeaverTree:
+    """The tree when there is nothing to grow (no budget or no drafted depth): the root alone."""
+    bs = root_ids.shape[0]
+    device = root_ids.device
+    tokens = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
+    parents = torch.full((bs, num_nodes), -1, dtype=torch.long, device=device)
+    depths = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
+    node_mask = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
+    draft_logprobs = torch.full(
+        (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
+    )
+    tokens[:, 0] = root_ids
+    node_mask[:, 0] = True
+    draft_logprobs[:, 0] = 0.0
+    return WeaverTree(tokens, parents, depths, node_mask, draft_logprobs)
+
+
+def construct_uzu_tree(
+    self,
+    *,
+    root_ids: torch.Tensor,
+    output_norm: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    candidate_weights: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    proposal_features: torch.Tensor,
+    token_embed: torch.Tensor,
+    shape: UzuTreeShape,
+) -> UzuConstructedTree:
+    """Grow a tree of the given shape on this step's inputs, without the final prune.
+
+    Everything but the shape comes from the worker: coupling, filters, depth cap. The served tree
+    is this with the worker's own shape, pruned; any other shape is a diagnostic tree grown on
+    the same draft, the same pool and the same Gumbel field.
+    """
     bs, depth, pool_size = candidate_ids.shape
+    if depth <= 0:
+        raise ValueError("A Weaver tree needs at least one drafted depth to grow.")
     coupling = self._gumbel_tree_inputs[bs] if self.use_gumbel_sampling else (None,) * 7
     separate_prune = self.use_gumbel_sampling and self.gumbel_prune_sigma_inv is not None
     filter_temperatures = (
         self._draft_filter_temperatures[bs] if self.use_gumbel_sampling else None
     )
-    node_budget = int(self.tree_budget)
-    final_num_nodes = node_budget + 1
-    batch_expand_width = int(self.tree_parents_per_round)
-    expand_width = int(self.tree_children_per_parent)
-    num_nodes = 1 + (self.tree_rounds - 1) * batch_expand_width
+    batch_expand_width = int(shape.parents_per_round)
+    expand_width = int(shape.children_per_parent)
+    num_nodes = shape.num_slots
     device = root_ids.device
     tokens = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
     parents = torch.full((bs, num_nodes), -1, dtype=torch.long, device=device)
@@ -718,8 +888,6 @@ def build_uzu_tree(
     node_mask[:, 0] = True
     draft_logprobs[:, 0] = 0.0
     node_scores[:, 0] = 0.0
-    if node_budget <= 0 or depth <= 0:
-        return WeaverTree(tokens, parents, depths, node_mask, draft_logprobs)
 
     frontier_slots = num_nodes * expand_width
     batch_indices = torch.arange(bs, dtype=torch.long, device=device)
@@ -875,6 +1043,7 @@ def build_uzu_tree(
 
     def materialize_frontier(slot_start: int, width: int) -> None:
         frontier_limit = max(width, slot_start * expand_width)
+        block_frontier = int(triton.next_power_of_2(frontier_limit))
         _uzu_materialize_frontier_kernel[(bs,)](
             frontier_tokens,
             frontier_parents,
@@ -901,6 +1070,7 @@ def build_uzu_tree(
             node_prune_scores,
             selected_prune_scores,
             int(slot_start),
+            int(frontier_limit),
             NUM_NODES=int(num_nodes),
             DEPTH=int(depth),
             MAX_TREE_DEPTH=int(self.tree_max_depth),
@@ -908,15 +1078,14 @@ def build_uzu_tree(
             SELECT_WIDTH=int(width),
             SCRATCH_WIDTH=int(batch_expand_width),
             BLOCK_DEPTH=int(triton.next_power_of_2(depth)),
-            BLOCK_FRONTIER=int(triton.next_power_of_2(frontier_limit)),
-            FRONTIER_LIMIT=int(frontier_limit),
+            BLOCK_FRONTIER=block_frontier,
             # Construction may intentionally materialize more nodes than
             # the final target-verification budget before the stable T-node
             # prune.  Every construction slot still needs its ancestor
             # chain for subsequent Weaver rounds.
             WRITE_ANCESTORS=slot_start + width <= num_nodes,
             SEPARATE_PRUNE=separate_prune,
-            num_warps=1,
+            num_warps=_frontier_select_warps(block_frontier),
         )
 
     def expand_node_indexed(
@@ -991,7 +1160,7 @@ def build_uzu_tree(
         1,
     )
 
-    for round_index in range(1, self.tree_rounds):
+    for round_index in range(1, shape.rounds):
         slot_start = 1 + (round_index - 1) * batch_expand_width
         width = batch_expand_width
         materialize_frontier(slot_start, width)
@@ -1038,18 +1207,19 @@ def build_uzu_tree(
             slot_start,
             width,
         )
-    return _weaver_prune_constructed_tree(
+    return UzuConstructedTree(
         node_tokens=tokens,
         node_parents=parents,
         node_depths=depths,
         node_mask=node_mask,
         node_logprobs=draft_logprobs,
-        node_scores=node_prune_scores,
+        node_scores=node_scores,
+        node_prune_scores=node_prune_scores,
         frontier_tokens=frontier_tokens,
         frontier_parents=frontier_parents,
         frontier_depths=frontier_depths,
         frontier_active=frontier_active,
         frontier_logprobs=frontier_logprobs,
-        frontier_scores=frontier_prune_scores,
-        final_num_nodes=final_num_nodes,
+        frontier_scores=frontier_scores,
+        frontier_prune_scores=frontier_prune_scores,
     )

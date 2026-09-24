@@ -1606,6 +1606,20 @@ class ServerArgs:
         "weaver_uzu with shared_gumbel only. Drop drafter candidates whose pool probability falls "
         "below min_p times the most likely one. 0.0 disables it.",
     ] = 0.0
+    speculative_dflash_tfm_uzu_tree_dump_dir: A[
+        Optional[str],
+        "weaver_uzu with shared_gumbel only, diagnostic. Directory to write, on every decode step, "
+        "the served tree before its final prune, every extra shape from "
+        "--speculative-dflash-tfm-uzu-tree-dump-shapes grown on the same step, and the step's "
+        "accept tokens. The verified tree and the generated text are unchanged. Requires "
+        "--max-running-requests 1. None disables it.",
+    ] = None
+    speculative_dflash_tfm_uzu_tree_dump_shapes: A[
+        Optional[str],
+        "weaver_uzu diagnostic. Comma-separated extra tree shapes RxWxC (rounds x parents per "
+        "round x children per parent), e.g. 16x32x16,64x32x16, grown on the same step as the "
+        "served tree for --speculative-dflash-tfm-uzu-tree-dump-dir only; never verified.",
+    ] = None
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
@@ -7069,6 +7083,29 @@ class ServerArgs:
                 "--speculative-dflash-tfm-proposal weaver_uzu. Anywhere else the tree is not "
                 "scored through that path and they would be a silent no-op."
             )
+        tree_dump_dir = self.speculative_dflash_tfm_uzu_tree_dump_dir
+        if self.speculative_dflash_tfm_uzu_tree_dump_shapes is not None and tree_dump_dir is None:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-shapes needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-dir: the extra trees are only dumped."
+            )
+        if tree_dump_dir is not None:
+            if not (
+                self.speculative_sampling_coupling == "shared_gumbel"
+                and self.speculative_algorithm == "DFLASH_TFM"
+                and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+            ):
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-tree-dump-dir requires "
+                    "--speculative-sampling-coupling shared_gumbel together with "
+                    "--speculative-algorithm DFLASH_TFM and "
+                    "--speculative-dflash-tfm-proposal weaver_uzu: it dumps that tree."
+                )
+            if self.max_running_requests != 1:
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-tree-dump-dir requires "
+                    "--max-running-requests 1: the dump records one request per step."
+                )
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

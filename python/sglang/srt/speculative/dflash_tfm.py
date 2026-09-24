@@ -2803,6 +2803,17 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 from sglang.srt.speculative.uzu_tree import configure_uzu_tree
 
                 configure_uzu_tree(self)
+        # Diagnostic per-step dump of the pre-prune tree and extra shapes; None serves as usual.
+        self.uzu_tree_dumper = None
+        tree_dump_dir = self.server_args.speculative_dflash_tfm_uzu_tree_dump_dir
+        if self.use_uzu_tree and tree_dump_dir is not None:
+            from sglang.srt.speculative.uzu_tree_dump import UzuTreeDumper
+
+            self.uzu_tree_dumper = UzuTreeDumper(
+                self,
+                tree_dump_dir,
+                self.server_args.speculative_dflash_tfm_uzu_tree_dump_shapes,
+            )
         if get_tp_group().world_size != 1:
             raise NotImplementedError(
                 "DFLASH_TFM MVP supports tensor_parallel_size=1 only."
@@ -4324,15 +4335,26 @@ class DFlashTfmWorker(DFlashWorkerV2):
             batch.spec_info = verify_input
             batch.return_hidden_states = False
             return
-        tree = self._build_tree(
-            root_ids=draft_input.bonus_tokens.to(torch.long),
-            output_norm=draft_input.output_norm,
-            candidate_ids=candidate_ids,
-            candidate_weights=candidate_weights,
-            candidate_scores=candidate_scores,
-            proposal_features=proposal_features,
-            token_embed=token_embed,
-        )
+        tree_inputs = {
+            "root_ids": draft_input.bonus_tokens.to(torch.long),
+            "output_norm": draft_input.output_norm,
+            "candidate_ids": candidate_ids,
+            "candidate_weights": candidate_weights,
+            "candidate_scores": candidate_scores,
+            "proposal_features": proposal_features,
+            "token_embed": token_embed,
+        }
+        tree = self._build_tree(**tree_inputs)
+        if self.uzu_tree_dumper is not None:
+            # Before verify: it advances batch.seq_lens in place, and the root sits at the
+            # pre-verify length.
+            self.uzu_tree_dumper.record_build(
+                self,
+                rid=batch.reqs[0].rid,
+                root_position=int(batch.seq_lens[0]),
+                served_tree=tree,
+                inputs=tree_inputs,
+            )
         mask_seq_lens_cpu = batch.seq_lens_cpu
         if mask_seq_lens_cpu is None:
             mask_seq_lens_cpu = batch.seq_lens.to("cpu", dtype=torch.int32)
@@ -4659,6 +4681,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
             hidden_size=self.hidden_size,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
         )
+        if self.uzu_tree_dumper is not None:
+            self.uzu_tree_dumper.record_accept(out_tokens[0, : int(commit_lens[0])])
         committed_seq_lens_cpu, committed_seq_lens_ready = (
             self._async_committed_seq_lens_cpu(
                 batch.seq_lens,
