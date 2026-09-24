@@ -216,6 +216,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        set_block_size = getattr(self.draft_model, "set_block_size", None)
+        if set_block_size is not None:
+            set_block_size(self.block_size)
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id

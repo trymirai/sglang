@@ -600,6 +600,47 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
+def get_dflash_layer_is_causal(config: Any, layer_id: int, layer_type: str) -> bool:
+    text_config = _get_text_config(config)
+    layer_is_causal = _cfg_get(
+        text_config,
+        "dflash_layer_is_causal",
+        _cfg_get(config, "dflash_layer_is_causal"),
+    )
+    if layer_is_causal is not None:
+        if isinstance(layer_is_causal, bool) or not isinstance(
+            layer_is_causal, Sequence
+        ):
+            raise ValueError(
+                "DFLASH config.dflash_layer_is_causal must be a sequence of booleans."
+            )
+        if layer_id >= len(layer_is_causal):
+            raise ValueError(
+                "DFLASH config.dflash_layer_is_causal must contain one entry per "
+                f"draft layer. Got {len(layer_is_causal)} entries, layer_id={layer_id}."
+            )
+        return bool(layer_is_causal[layer_id])
+
+    is_causal = _cfg_get(
+        text_config,
+        "is_causal",
+        _cfg_get(config, "is_causal"),
+    )
+    if is_causal is not None:
+        return bool(is_causal)
+
+    dflash_config = _cfg_get(
+        text_config, "dflash_config", _cfg_get(config, "dflash_config")
+    )
+    causal = _cfg_get(dflash_config, "causal")
+    if causal is not None:
+        return bool(causal)
+
+    # Preserve the published defaults: classic DFlash full attention is
+    # bidirectional, while Qwen's sliding-attention draft layers are causal.
+    return layer_type == "sliding_attention"
+
+
 def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
@@ -682,6 +723,8 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    conv_kernel_size: int
+    conv_group_size: int
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -760,6 +803,23 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 0),
+        field_name="DFLASH conv_kernel_size",
+        min_value=0,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if bool(conv_kernel_size) != bool(conv_group_size):
+        raise ValueError(
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
+            f"together. Got conv_kernel_size={conv_kernel_size}, "
+            f"conv_group_size={conv_group_size}."
+        )
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -809,6 +869,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

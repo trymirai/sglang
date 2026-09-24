@@ -29,10 +29,12 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
+    get_dflash_layer_is_causal,
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
@@ -46,25 +48,26 @@ def _get_dflash_layer_attention_params(
 ) -> Tuple[int, AttentionType]:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
+        layer_type = "full_attention"
+    else:
+        if layer_id >= len(layer_types):
+            raise ValueError(
+                "DFLASH config.layer_types must contain one entry per draft layer. "
+                f"Got {len(layer_types)} entries, layer_id={layer_id}."
+            )
+        layer_type = layer_types[layer_id]
 
-    layer_type = layer_types[layer_id]
+    is_causal = get_dflash_layer_is_causal(config, layer_id, layer_type)
+    attn_type = AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
+
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        return -1, attn_type
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
         # Meta's original assistant uses bidirectional sliding attention.
-        attn_type = (
-            AttentionType.ENCODER_ONLY
-            if config.model_type == "muse_glimmer_assistant"
-            else AttentionType.DECODER
-        )
+        if config.model_type == "muse_glimmer_assistant":
+            attn_type = AttentionType.ENCODER_ONLY
         return sliding_window_size, attn_type
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
@@ -270,8 +273,80 @@ class DFlashMLP(nn.Module):
         return x
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    out = coefficients[:, 0] * blocks
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    if block_size & (block_size - 1) == 0:
+        position = position & (block_size - 1)
+    else:
+        position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return out.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise convolution used by DFlash2."""
+
+    def __init__(
+        self, hidden_size: int, block_size: int, taps: int, group_size: int
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = int(hidden_size) // self.group_size
+        base_kernel = torch.zeros(2, self.taps, int(hidden_size))
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        self.kernel_projection = nn.Linear(
+            int(hidden_size), 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        torch._dynamo.mark_static(hidden_states, 1)
+        torch._dynamo.mark_static(delta, 1)
+        torch._dynamo.mark_static(delta, 2)
+        return _grouped_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor):
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        attention_conv: Optional[DFlashGroupedConv] = None,
+        mlp_conv: Optional[DFlashGroupedConv] = None,
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -280,6 +355,8 @@ class DFlashDecoderLayer(nn.Module):
         self.self_attn = DFlashAttention(config=config, layer_id=layer_id)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config)
+        self.attention_conv = attention_conv
+        self.mlp_conv = mlp_conv
 
     def forward(
         self,
@@ -301,13 +378,26 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -327,9 +417,31 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        draft_config = self.draft_config = parse_dflash_draft_config(
+            draft_hf_config=config
+        )
+        self.block_size = int(draft_config.resolve_block_size(default=16))
+
+        def grouped_conv() -> Optional[DFlashGroupedConv]:
+            if not draft_config.conv_kernel_size:
+                return None
+            return DFlashGroupedConv(
+                hidden_size,
+                self.block_size,
+                draft_config.conv_kernel_size,
+                draft_config.conv_group_size,
+            )
 
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
+            [
+                DFlashDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    attention_conv=grouped_conv(),
+                    mlp_conv=grouped_conv(),
+                )
+                for i in range(num_layers)
+            ]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -352,7 +464,12 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = draft_config.resolve_block_size(default=16)
+    def set_block_size(self, block_size: int) -> None:
+        self.block_size = int(block_size)
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None:
+                    conv.block_size = self.block_size
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -433,6 +550,9 @@ class DFlashDraftModel(nn.Module):
                 prefixed_name = f"model.{name}"
                 if prefixed_name in params_dict:
                     return prefixed_name
+            aliased_name = encoder_aliases.get(name)
+            if aliased_name is not None and aliased_name in params_dict:
+                return aliased_name
             return None
 
         for name, loaded_weight in weights:
