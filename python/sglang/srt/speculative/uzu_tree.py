@@ -120,6 +120,10 @@ class UzuConstructedTree(msgspec.Struct):
 
     def prune(self, final_num_nodes: int) -> WeaverTree:
         """Keep the top final_num_nodes nodes by prune score, as the served tree does."""
+        return self.prune_with_sources(final_num_nodes)[0]
+
+    def prune_with_sources(self, final_num_nodes: int) -> tuple[WeaverTree, torch.Tensor]:
+        """The pruned tree and, per kept node, its source: the index into slots followed by frontier."""
         return _weaver_prune_constructed_tree(
             node_tokens=self.node_tokens,
             node_parents=self.node_parents,
@@ -134,6 +138,36 @@ class UzuConstructedTree(msgspec.Struct):
             frontier_logprobs=self.frontier_logprobs,
             frontier_scores=self.frontier_prune_scores,
             final_num_nodes=final_num_nodes,
+        )
+
+
+class UzuTreeInternals(msgspec.Struct):
+    """What each construction slot's Weaver step saw, filled by construct_uzu_tree on request.
+
+    Row ``s`` of every tensor belongs to construction slot ``s`` (the same index as
+    ``UzuConstructedTree.node_*``): ``slot_states`` is the read-out query the pool was scored
+    against, ``slot_residuals`` the residual logits before the drafter's candidate scores are
+    added, ``slot_logits`` the pool logits the slot's children were taken from. Rows of slots
+    that were never filled, or were filled but not expanded, hold whatever the step computed and
+    must be read through the tree's own masks.
+    """
+
+    slot_states: torch.Tensor
+    slot_residuals: torch.Tensor
+    slot_logits: torch.Tensor
+
+    @classmethod
+    def empty(
+        cls, bs: int, num_slots: int, d_rank: int, pool_size: int, *, device, dtype
+    ) -> UzuTreeInternals:
+        return cls(
+            slot_states=torch.zeros((bs, num_slots, d_rank), dtype=dtype, device=device),
+            slot_residuals=torch.zeros(
+                (bs, num_slots, pool_size), dtype=torch.float32, device=device
+            ),
+            slot_logits=torch.zeros(
+                (bs, num_slots, pool_size), dtype=torch.float32, device=device
+            ),
         )
 
 
@@ -683,8 +717,8 @@ def _weaver_prune_constructed_tree(
     frontier_logprobs: torch.Tensor,
     frontier_scores: torch.Tensor,
     final_num_nodes: int,
-) -> WeaverTree:
-    """Apply Uzu's final cumulative-path-score prune on the GPU.
+) -> tuple[WeaverTree, torch.Tensor]:
+    """Apply Uzu's final cumulative-path-score prune on the GPU; also return the kept sources.
 
     Construction slots are already topological. Active frontier nodes are
     appended after them. Stable score sorting therefore resolves exact ties in
@@ -722,13 +756,14 @@ def _weaver_prune_constructed_tree(
     compact_parents = torch.gather(
         inverse, 1, selected_parents.clamp_min(0)
     ).masked_fill(selected_parents < 0, -1)
-    return WeaverTree(
+    tree = WeaverTree(
         torch.gather(all_tokens, 1, selected_sources),
         compact_parents,
         torch.gather(all_depths, 1, selected_sources),
         torch.gather(all_mask, 1, selected_sources),
         torch.gather(all_logprobs, 1, selected_sources),
     )
+    return tree, selected_sources
 
 
 def _filter_draft_logits(
@@ -857,12 +892,18 @@ def construct_uzu_tree(
     proposal_features: torch.Tensor,
     token_embed: torch.Tensor,
     shape: UzuTreeShape,
+    internals: UzuTreeInternals | None = None,
 ) -> UzuConstructedTree:
     """Grow a tree of the given shape on this step's inputs, without the final prune.
 
     Everything but the shape comes from the worker: coupling, filters, depth cap. The served tree
     is this with the worker's own shape, pruned; any other shape is a diagnostic tree grown on
     the same draft, the same pool and the same Gumbel field.
+
+    With ``internals`` every Weaver step runs the compiled variant that also returns its read-out
+    state and residual logits, and writes them into the slots it expands. That variant may differ
+    from the plain one in the last bits, so the internals dump serves this very tree rather than
+    comparing it with a separately built one.
     """
     bs, depth, pool_size = candidate_ids.shape
     if depth <= 0:
@@ -1094,6 +1135,8 @@ def construct_uzu_tree(
         candidate_row_index: torch.Tensor,
         parent_ancestors: torch.Tensor,
         row_batch_indices: torch.Tensor,
+        slot_start: int,
+        width: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         step_kwargs = dict(
             token_ids=token_ids,
@@ -1113,14 +1156,29 @@ def construct_uzu_tree(
             row_batch_indices=row_batch_indices,
             token_embed=token_embed,
         )
-        (
-            logits,
-            current_keys,
-            current_values,
-            row_candidate_ids,
-        ) = self._weaver_indexed_step_compiled(
-            **step_kwargs,
-        )
+        if internals is None:
+            (
+                logits,
+                current_keys,
+                current_values,
+                row_candidate_ids,
+            ) = self._weaver_indexed_step_compiled(
+                **step_kwargs,
+            )
+        else:
+            (
+                logits,
+                current_keys,
+                current_values,
+                row_candidate_ids,
+                states,
+                residuals,
+            ) = self._weaver_indexed_step_compiled(**step_kwargs, with_internals=True)
+            # Rows are batch-major, width rows per request, as in the publish kernel.
+            slots = slice(slot_start, slot_start + width)
+            internals.slot_states[:, slots] = states.view(bs, width, -1)
+            internals.slot_residuals[:, slots] = residuals.view(bs, width, -1)
+            internals.slot_logits[:, slots] = logits.float().view(bs, width, -1)
         return (
             logits.float(),
             row_candidate_ids,
@@ -1145,6 +1203,8 @@ def construct_uzu_tree(
         batch_indices * depth,
         root_parent_ancestors,
         batch_indices,
+        0,
+        1,
     )
     publish_frontier(
         root_logits,
@@ -1193,6 +1253,8 @@ def construct_uzu_tree(
             candidate_row_index_flat,
             parent_ancestors,
             row_batch_indices_flat,
+            slot_start,
+            width,
         )
         publish_frontier(
             logits,

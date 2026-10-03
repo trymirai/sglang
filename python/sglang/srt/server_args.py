@@ -1620,6 +1620,17 @@ class ServerArgs:
         "round x children per parent), e.g. 16x32x16,64x32x16, grown on the same step as the "
         "served tree for --speculative-dflash-tfm-uzu-tree-dump-dir only; never verified.",
     ] = None
+    speculative_dflash_tfm_uzu_tree_dump_internals: A[
+        bool,
+        "weaver_uzu, for --speculative-dflash-tfm-uzu-tree-dump-dir only. Dump every step as the "
+        "training record of a model of the tree's acceptance: the pre-prune tree with its builder "
+        "scores and kept nodes, the candidate pools with the drafter's log-normaliser and the shared "
+        "Gumbel field, the Weaver residual logits and read-out state of every expanded node, the "
+        "drafter's and the target's hidden states, and at every verified node the target's top-64 "
+        "logits, log-normaliser, filtered sampling distribution and shared-Gumbel choice. The served "
+        "tree is built once, eagerly, and that tree is verified. Needs --disable-overlap-schedule, "
+        "so that no step is drafted past the end of a request.",
+    ] = False
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
@@ -7088,6 +7099,19 @@ class ServerArgs:
             raise ValueError(
                 "--speculative-dflash-tfm-uzu-tree-dump-shapes needs "
                 "--speculative-dflash-tfm-uzu-tree-dump-dir: the extra trees are only dumped."
+            )
+        if self.speculative_dflash_tfm_uzu_tree_dump_internals and tree_dump_dir is None:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-internals needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-dir: the internals are only dumped."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_internals
+            and not self.disable_overlap_schedule
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-internals needs --disable-overlap-schedule: "
+                "the overlap scheduler drafts one step past the end of a request."
             )
         if tree_dump_dir is not None:
             if not (

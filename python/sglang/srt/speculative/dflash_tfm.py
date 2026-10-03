@@ -1851,7 +1851,14 @@ class Weaver(nn.Module):
         parent_ancestors: torch.Tensor,
         row_batch_indices: torch.Tensor,
         token_embed: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_internals: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        """Weaver logits over each row's candidate pool, plus the row's keys and values.
+
+        With return_internals the output also carries the read-out state (out_norm of the last
+        layer, the query the pool is scored against) and the residual logits before the drafter's
+        candidate scores are added. The tree dump reads them; the served path never asks.
+        """
         depth = parent_ancestors.shape[1]
         x = self._token_project(token_ids[:, None], token_embed)
         position_ids = position_ids.clamp(min=0, max=depth - 1)
@@ -1878,7 +1885,10 @@ class Weaver(nn.Module):
         )
         logits = candidate_scores.float() + residual
         logits = logits.masked_fill(candidate_ids < 0, -torch.inf)
-        return logits, torch.stack(current_key_layers), torch.stack(current_value_layers)
+        keys, values = torch.stack(current_key_layers), torch.stack(current_value_layers)
+        if return_internals:
+            return logits, keys, values, query, residual
+        return logits, keys, values
 
     def step_chain(
         self,
@@ -2813,6 +2823,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 self,
                 tree_dump_dir,
                 self.server_args.speculative_dflash_tfm_uzu_tree_dump_shapes,
+                internals=self.server_args.speculative_dflash_tfm_uzu_tree_dump_internals,
             )
         if get_tp_group().world_size != 1:
             raise NotImplementedError(
@@ -3037,8 +3048,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
         parent_ancestors: torch.Tensor,
         row_batch_indices: torch.Tensor,
         token_embed: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        with_internals: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        # with_internals compiles a variant of its own (it is in the key) that also returns the
+        # Weaver read-out state and residual logits; only the internals tree dump uses it.
         key = (
+            bool(with_internals),
             tuple(token_ids.shape),
             token_ids.dtype,
             tuple(candidate_ids.shape),
@@ -3108,8 +3123,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     parent_ancestors=parent_ancestors,
                     row_batch_indices=row_batch_indices,
                     token_embed=token_embed,
+                    return_internals=with_internals,
                 )
-                return (*outputs, candidate_ids)
+                return (*outputs[:3], candidate_ids, *outputs[3:])
 
             compiled_step = torch.compile(
                 step_fn,
@@ -4344,17 +4360,28 @@ class DFlashTfmWorker(DFlashWorkerV2):
             "proposal_features": proposal_features,
             "token_embed": token_embed,
         }
-        tree = self._build_tree(**tree_inputs)
-        if self.uzu_tree_dumper is not None:
-            # Before verify: it advances batch.seq_lens in place, and the root sits at the
-            # pre-verify length.
-            self.uzu_tree_dumper.record_build(
+        dumper = self.uzu_tree_dumper
+        # The dump runs before verify: verify advances batch.seq_lens in place, and the root sits
+        # at the pre-verify length.
+        if dumper is not None and dumper.internals:
+            # The internals dump builds the served tree itself, once and eagerly, so that the
+            # dumped tree is the very tree the verifier reads.
+            tree = dumper.build_served(
                 self,
                 rid=batch.reqs[0].rid,
                 root_position=int(batch.seq_lens[0]),
-                served_tree=tree,
                 inputs=tree_inputs,
             )
+        else:
+            tree = self._build_tree(**tree_inputs)
+            if dumper is not None:
+                dumper.record_build(
+                    self,
+                    rid=batch.reqs[0].rid,
+                    root_position=int(batch.seq_lens[0]),
+                    served_tree=tree,
+                    inputs=tree_inputs,
+                )
         mask_seq_lens_cpu = batch.seq_lens_cpu
         if mask_seq_lens_cpu is None:
             mask_seq_lens_cpu = batch.seq_lens.to("cpu", dtype=torch.int32)
@@ -4682,7 +4709,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
         )
         if self.uzu_tree_dumper is not None:
-            self.uzu_tree_dumper.record_accept(out_tokens[0, : int(commit_lens[0])])
+            self.uzu_tree_dumper.record_accept(
+                out_tokens[0, : int(commit_lens[0])],
+                logits=logits_output.next_token_logits,
+                sampling_info=batch.sampling_info,
+                positions=verify_input.positions,
+            )
         committed_seq_lens_cpu, committed_seq_lens_ready = (
             self._async_committed_seq_lens_cpu(
                 batch.seq_lens,
