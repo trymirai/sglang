@@ -1620,6 +1620,15 @@ class ServerArgs:
         "for the slots each round expands, in one fused kernel, and the prune reuses it. Both give "
         "the same scores up to fp32 rounding; this keeps the old path for comparisons.",
     ] = False
+    speculative_dflash_tfm_uzu_expand_without_weaver: A[
+        bool,
+        "weaver_uzu, diagnostic. Grow the tree on the drafter alone: every expanded node takes "
+        "its children as the top of the drafter's pool logits (with the shared Gumbel field when "
+        "coupled) and the frontier is ranked by the drafter's path weight, without the Weaver "
+        "residual. Weaver still runs at every expanded node, and its logits still feed a "
+        "confidence head or a separate prune score. The tree's topology then depends on the "
+        "drafter only, as if Weaver were run once over the finished tree.",
+    ] = False
     speculative_dflash_tfm_uzu_draft_temperature: A[
         Optional[float],
         "weaver_uzu with shared_gumbel only. Temperature the DRAFTER is scored at, decoupled from "
@@ -7196,6 +7205,15 @@ class ServerArgs:
             raise ValueError(
                 "--speculative-dflash-tfm-uzu-confidence-head-expand needs "
                 "--speculative-dflash-tfm-uzu-confidence-head: it expands by that head's score."
+            )
+        if self.speculative_dflash_tfm_uzu_expand_without_weaver and not (
+            self.speculative_algorithm == "DFLASH_TFM"
+            and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-expand-without-weaver needs "
+                "--speculative-algorithm DFLASH_TFM with --speculative-dflash-tfm-proposal "
+                "weaver_uzu: it changes how that tree grows."
             )
         if self.speculative_dflash_tfm_uzu_expansion_head is not None:
             if not (

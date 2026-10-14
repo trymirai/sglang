@@ -247,6 +247,13 @@ def configure_uzu_tree(worker) -> None:
     worker.uzu_confidence_head_expand_coverage = bool(
         args.speculative_dflash_tfm_uzu_confidence_head_expand_coverage
     )
+    worker.uzu_expand_without_weaver = bool(
+        args.speculative_dflash_tfm_uzu_expand_without_weaver
+    )
+    if worker.uzu_expand_without_weaver:
+        logger.info(
+            "weaver_uzu grows the tree on the drafter alone; Weaver logits only score it"
+        )
     worker.uzu_expansion_head = None
     head_dir = args.speculative_dflash_tfm_uzu_confidence_head
     if head_dir is not None:
@@ -1394,6 +1401,10 @@ def construct_uzu_tree(
             slot_logits[:, slot_start : slot_start + width] = logits.float().view(
                 bs, width, -1
             )
+        if self.uzu_expand_without_weaver:
+            # The children and the frontier priority come from the drafter's pool logits; the
+            # Weaver logits above stay with the slot for the prune.
+            logits = candidate_scores_rows[candidate_row_index]
         return (
             logits.float(),
             row_candidate_ids,

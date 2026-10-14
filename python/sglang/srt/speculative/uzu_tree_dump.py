@@ -546,6 +546,9 @@ class UzuTreeDumper:
             "confidence_head_expand_coverage": bool(
                 worker.uzu_confidence_head_expand_coverage
             ),
+            # The tree grown on the drafter alone (children and priority without the Weaver
+            # residual); the dumped rho is still the Weaver residual of every expanded slot.
+            "expand_without_weaver": bool(worker.uzu_expand_without_weaver),
             # A separate head that sets the expansion priority (its local log r), or None.
             "expansion_head": (
                 None
