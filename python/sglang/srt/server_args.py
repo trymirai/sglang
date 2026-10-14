@@ -1574,6 +1574,52 @@ class ServerArgs:
         "is the current behaviour; inf prunes by the noise-free score. Frontier priority always "
         "uses --speculative-dflash-tfm-uzu-weight-sigma.",
     ] = None
+    speculative_dflash_tfm_uzu_confidence_head: A[
+        Optional[str],
+        "weaver_uzu with shared_gumbel only. Directory of an exported confidence head "
+        "(head.json and head.safetensors): the final prune ranks nodes by the head's estimate of "
+        "the log-probability that a node lies on the target's path instead of by the cumulative "
+        "path score. The head reads the shared Gumbel field and was trained on trees grown with "
+        "the default edge weight (sigma inf, no drafter calibration), so it requires exactly "
+        "those and replaces --speculative-dflash-tfm-uzu-prune-sigma. None prunes as before.",
+    ] = None
+    speculative_dflash_tfm_uzu_confidence_head_expand: A[
+        bool,
+        "weaver_uzu with --speculative-dflash-tfm-uzu-confidence-head only. The head also sets the "
+        "expansion priority: after every round the frontier is re-scored with the head's log r, so "
+        "the tree grows best-first by the head's score, not by the drafter's path weight. A head "
+        "with tree attention expands by its local part (without the attention corrections) and "
+        "prunes by the full head: the local part scores a child from its parent and path alone, so "
+        "the scores of earlier rounds stay valid as the tree grows. Costs one head pass per round. "
+        "With --speculative-dflash-tfm-uzu-prune-sigma the head only expands and the prune keeps "
+        "that sigma score.",
+    ] = False
+    speculative_dflash_tfm_uzu_confidence_head_expand_coverage: A[
+        bool,
+        "weaver_uzu with --speculative-dflash-tfm-uzu-confidence-head-expand only. Rank the "
+        "frontier by log r + log kappa instead of log r: kappa(n) is the head's coverage branch, "
+        "the probability that the target's choice after n is among n's children, so the sum is "
+        "the log-probability that expanding n adds a node of the target's path. Needs a head with "
+        "a coverage branch (format 3); the prune is unchanged.",
+    ] = False
+    speculative_dflash_tfm_uzu_expansion_head: A[
+        Optional[str],
+        "weaver_uzu with shared_gumbel only. Directory of an exported confidence head that sets the "
+        "expansion priority only: after every round the frontier is re-scored with its local log r "
+        "(a head with tree attention without its attention corrections), so the tree grows "
+        "best-first by that head while the prune keeps its own score: the head of "
+        "--speculative-dflash-tfm-uzu-confidence-head, or --speculative-dflash-tfm-uzu-prune-sigma. "
+        "Replaces --speculative-dflash-tfm-uzu-confidence-head-expand, which expands by the prune "
+        "head itself. Costs one head pass per round.",
+    ] = None
+    speculative_dflash_tfm_uzu_confidence_head_recompute: A[
+        bool,
+        "weaver_uzu with an expanding confidence head, diagnostic. Re-score the whole tree with the "
+        "head after every round and recompute everything at the prune, instead of the incremental "
+        "path: a vector head (format 5) of the supported form otherwise computes its local part only "
+        "for the slots each round expands, in one fused kernel, and the prune reuses it. Both give "
+        "the same scores up to fp32 rounding; this keeps the old path for comparisons.",
+    ] = False
     speculative_dflash_tfm_uzu_draft_temperature: A[
         Optional[float],
         "weaver_uzu with shared_gumbel only. Temperature the DRAFTER is scored at, decoupled from "
@@ -7093,6 +7139,86 @@ class ServerArgs:
                 "--speculative-algorithm DFLASH_TFM and "
                 "--speculative-dflash-tfm-proposal weaver_uzu. Anywhere else the tree is not "
                 "scored through that path and they would be a silent no-op."
+            )
+        if self.speculative_dflash_tfm_uzu_confidence_head is not None:
+            if not (
+                self.speculative_sampling_coupling == "shared_gumbel"
+                and self.speculative_algorithm == "DFLASH_TFM"
+                and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+            ):
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-confidence-head requires "
+                    "--speculative-sampling-coupling shared_gumbel together with "
+                    "--speculative-algorithm DFLASH_TFM and "
+                    "--speculative-dflash-tfm-proposal weaver_uzu: the head prunes that tree "
+                    "and reads its shared Gumbel field."
+                )
+            if (
+                prune_sigma is not None
+                and not self.speculative_dflash_tfm_uzu_confidence_head_expand
+            ):
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-confidence-head replaces the prune score; "
+                    "drop --speculative-dflash-tfm-uzu-prune-sigma, or add "
+                    "--speculative-dflash-tfm-uzu-confidence-head-expand to expand by the head "
+                    "and prune by that sigma."
+                )
+            if math.isfinite(weight_sigma) or draft_calibration_set:
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-confidence-head was trained on trees grown "
+                    "with --speculative-dflash-tfm-uzu-weight-sigma inf and no drafter "
+                    "calibration flags; its features are defined on those trees only."
+                )
+        if (
+            self.speculative_dflash_tfm_uzu_confidence_head_expand
+            and self.speculative_dflash_tfm_uzu_confidence_head is None
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-confidence-head-expand needs "
+                "--speculative-dflash-tfm-uzu-confidence-head: it expands by that head's score."
+            )
+        if self.speculative_dflash_tfm_uzu_expansion_head is not None:
+            if not (
+                self.speculative_sampling_coupling == "shared_gumbel"
+                and self.speculative_algorithm == "DFLASH_TFM"
+                and self.speculative_dflash_tfm_proposal == "weaver_uzu"
+            ):
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-expansion-head requires "
+                    "--speculative-sampling-coupling shared_gumbel together with "
+                    "--speculative-algorithm DFLASH_TFM and "
+                    "--speculative-dflash-tfm-proposal weaver_uzu: the head ranks that tree's "
+                    "frontier and reads its shared Gumbel field."
+                )
+            if self.speculative_dflash_tfm_uzu_confidence_head_expand:
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-expansion-head and "
+                    "--speculative-dflash-tfm-uzu-confidence-head-expand both set the expansion "
+                    "priority; use one of them."
+                )
+            if math.isfinite(weight_sigma) or draft_calibration_set:
+                raise ValueError(
+                    "--speculative-dflash-tfm-uzu-expansion-head was trained on trees grown with "
+                    "--speculative-dflash-tfm-uzu-weight-sigma inf and no drafter calibration "
+                    "flags; its features are defined on those trees only."
+                )
+        if self.speculative_dflash_tfm_uzu_confidence_head_recompute and not (
+            self.speculative_dflash_tfm_uzu_expansion_head is not None
+            or self.speculative_dflash_tfm_uzu_confidence_head_expand
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-confidence-head-recompute needs a head that expands "
+                "the tree (--speculative-dflash-tfm-uzu-expansion-head or "
+                "--speculative-dflash-tfm-uzu-confidence-head-expand)."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_confidence_head_expand_coverage
+            and not self.speculative_dflash_tfm_uzu_confidence_head_expand
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-confidence-head-expand-coverage needs "
+                "--speculative-dflash-tfm-uzu-confidence-head-expand: it changes that expansion "
+                "priority."
             )
         tree_dump_dir = self.speculative_dflash_tfm_uzu_tree_dump_dir
         if self.speculative_dflash_tfm_uzu_tree_dump_shapes is not None and tree_dump_dir is None:

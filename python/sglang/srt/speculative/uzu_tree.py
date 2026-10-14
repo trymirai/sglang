@@ -27,6 +27,11 @@ Weaver inference and verification remain in dflash_tfm.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+from pathlib import Path
+
 import msgspec
 import torch
 import triton
@@ -35,6 +40,30 @@ import triton.language as tl
 # Loaded lazily by DFlashTfmWorker after dflash_tfm finishes importing.
 from sglang.srt.speculative.dflash_tfm import WeaverTree
 from sglang.srt.speculative.shared_gumbel import gumbel_at
+from sglang.srt.speculative.uzu_confidence_head import (
+    CONFIG,
+    WEIGHTS,
+    ConfidenceHead,
+    ExpandedTree,
+    TreeInputs,
+    VectorConfidenceHead,
+)
+from sglang.srt.speculative.uzu_confidence_kernel import (
+    RoundState,
+    VectorKernelWeights,
+    child_positions,
+    expand_round,
+    supports,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class UzuRoundKernel(msgspec.Struct, frozen=True):
+    """The expanding head whose local part the rounds compute incrementally, and its packed weights."""
+
+    head: VectorConfidenceHead
+    weights: VectorKernelWeights
 
 
 class UzuTreeShape(msgspec.Struct, frozen=True):
@@ -211,6 +240,110 @@ def configure_uzu_tree(worker) -> None:
             "weaver_uzu requires target_only verification; "
             "its pruned proposals do not implement traversal rejection."
         )
+    worker.uzu_confidence_head = None
+    worker.uzu_confidence_head_expand = bool(
+        args.speculative_dflash_tfm_uzu_confidence_head_expand
+    )
+    worker.uzu_confidence_head_expand_coverage = bool(
+        args.speculative_dflash_tfm_uzu_confidence_head_expand_coverage
+    )
+    worker.uzu_expansion_head = None
+    head_dir = args.speculative_dflash_tfm_uzu_confidence_head
+    if head_dir is not None:
+        head = _load_confidence_head(worker, head_dir)
+        worker.uzu_confidence_head = head
+        if worker.gumbel_prune_sigma_inv is None:
+            logger.info("weaver_uzu prunes with the confidence head %s", head.source)
+        if worker.uzu_confidence_head_expand_coverage and head.expansion is None:
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-confidence-head-expand-coverage needs a confidence "
+                f"head with a coverage branch (format 3); {head.source} has none."
+            )
+        if worker.uzu_confidence_head_expand:
+            logger.info(
+                "weaver_uzu expands by the %s confidence head %s%s",
+                (
+                    "local part (no tree attention) of the"
+                    if head.tree is not None
+                    else ""
+                ),
+                head.source,
+                (
+                    " with its coverage branch (log r + log kappa)"
+                    if worker.uzu_confidence_head_expand_coverage
+                    else ""
+                ),
+            )
+    expansion_dir = args.speculative_dflash_tfm_uzu_expansion_head
+    if expansion_dir is not None:
+        prune_head = worker.uzu_confidence_head
+        if prune_head is not None and _same_export(expansion_dir, prune_head):
+            # One head both expands (its local part) and prunes: one instance, one token table.
+            expansion_head = prune_head
+        else:
+            expansion_head = _load_confidence_head(worker, expansion_dir)
+        worker.uzu_expansion_head = expansion_head
+        logger.info(
+            "weaver_uzu expands by the %sconfidence head %s; the prune keeps its own score",
+            (
+                "local part (no tree attention) of the "
+                if expansion_head.tree is not None
+                else ""
+            ),
+            expansion_head.source,
+        )
+    worker.uzu_round_kernel = None
+    expanding = (
+        worker.uzu_expansion_head
+        if worker.uzu_expansion_head is not None
+        else worker.uzu_confidence_head if worker.uzu_confidence_head_expand else None
+    )
+    if expanding is not None:
+        if (
+            isinstance(expanding, VectorConfidenceHead)
+            and supports(expanding.config)
+            and not worker.uzu_confidence_head_expand_coverage
+            and not args.speculative_dflash_tfm_uzu_confidence_head_recompute
+        ):
+            worker.uzu_round_kernel = UzuRoundKernel(
+                head=expanding, weights=VectorKernelWeights.pack(expanding)
+            )
+            logger.info(
+                "weaver_uzu computes the expanding head's local part only for the slots each "
+                "round expands (fused round kernel)%s",
+                (
+                    "; the prune reuses it"
+                    if expanding is worker.uzu_confidence_head
+                    else ""
+                ),
+            )
+        else:
+            logger.info(
+                "weaver_uzu re-scores the whole tree with the expanding head after every round"
+            )
+
+
+def _load_confidence_head(worker, directory: str) -> ConfidenceHead:
+    # The head projects the target's raw input embedding, not the Weaver token embedding the
+    # tree is grown with.
+    embed_module, _ = worker._target_embedding_and_lm_head()
+    embedding = embed_module.weight
+    head = ConfidenceHead.load(directory, embedding, embedding.device, compile=True)
+    head.check_tree(
+        worker.tree_children_per_parent,
+        worker.tree_max_depth,
+        worker.candidate_pool_size,
+        int(embedding.shape[1]),
+    )
+    return head
+
+
+def _same_export(directory: str, head: ConfidenceHead) -> bool:
+    """Whether the export in directory is the head already loaded: the same config and weights."""
+    path = Path(directory)
+    config = json.loads((path / CONFIG).read_text())
+    digest = hashlib.sha256((path / WEIGHTS).read_bytes()).hexdigest()
+    return config == head.config and digest == head.config["weights_sha256"]
 
 
 # The frontier limit changes every round (slot_start * C). As a constexpr it compiled one variant
@@ -681,6 +814,50 @@ def _uzu_publish_frontier_kernel(
             )
 
 
+@triton.jit
+def _pool_gumbel_kernel(
+    noise_ptr,
+    tokens_ptr,
+    seeds_ptr,
+    positions_ptr,
+    DEPTH: tl.constexpr,
+    POOL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per (request, pool row d). The children of a node at depth d come from
+    # pool row d and draw the field at the request's position plus d, exactly as the
+    # publish kernel does; slots without a token read token -1 there too.
+    program = tl.program_id(0)
+    batch = program // DEPTH
+    row = program - batch * DEPTH
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < POOL
+    tokens = tl.load(tokens_ptr + program * POOL + offsets, mask=mask, other=-1)
+    noise = gumbel_at(
+        tl.load(seeds_ptr + batch), tl.load(positions_ptr + batch) + row, tokens
+    )
+    tl.store(noise_ptr + program * POOL + offsets, noise, mask=mask)
+
+
+def pool_gumbels(worker, candidate_ids: torch.Tensor) -> torch.Tensor:
+    """The shared Gumbel field on the candidate pool of every depth, [bs, depth, pool], as
+    the tree kernel draws it."""
+    bs, depth, pool = candidate_ids.shape
+    seeds, positions = worker._gumbel_tree_inputs[bs][:2]
+    rows = candidate_ids.contiguous()
+    noise = torch.empty(rows.shape, dtype=torch.float32, device=rows.device)
+    _pool_gumbel_kernel[(bs * depth,)](
+        noise,
+        rows,
+        seeds,
+        positions,
+        DEPTH=int(depth),
+        POOL=int(pool),
+        BLOCK=int(triton.next_power_of_2(pool)),
+    )
+    return noise
+
+
 def _frontier_select_warps(block_frontier: int) -> int:
     """Warps for the frontier select: one up to 1024 slots, then one per 1024 up to 16.
 
@@ -861,6 +1038,8 @@ def build_uzu_tree(
         proposal_features=proposal_features,
         token_embed=token_embed,
         shape=shape,
+        confidence_head=self.uzu_confidence_head,
+        expansion_head=self.uzu_expansion_head,
     ).prune(node_budget + 1)
 
 
@@ -893,6 +1072,8 @@ def construct_uzu_tree(
     token_embed: torch.Tensor,
     shape: UzuTreeShape,
     internals: UzuTreeInternals | None = None,
+    confidence_head: ConfidenceHead | None = None,
+    expansion_head: ConfidenceHead | None = None,
 ) -> UzuConstructedTree:
     """Grow a tree of the given shape on this step's inputs, without the final prune.
 
@@ -904,12 +1085,29 @@ def construct_uzu_tree(
     state and residual logits, and writes them into the slots it expands. That variant may differ
     from the plain one in the last bits, so the internals dump serves this very tree rather than
     comparing it with a separately built one.
+
+    With ``confidence_head`` the prune scores are the head's log r instead of the cumulative
+    path score; the pool logits of every slot are kept for it on the way. With the worker's
+    ``uzu_confidence_head_expand`` the head's local part (a head with tree attention without its
+    attention corrections) is run after every round as well and its log r becomes the frontier
+    priority, so the tree grows best-first by the head's score; a sigma_prune then keeps its own
+    prune score and the head only expands. With ``uzu_confidence_head_expand_coverage`` the
+    priority is log r + log kappa of the head's coverage branch instead; the prune still reads
+    log r. With ``expansion_head`` that head's local part sets the frontier priority instead of
+    the prune head, and the prune keeps its own score (the prune head's log r or sigma_prune).
     """
     bs, depth, pool_size = candidate_ids.shape
     if depth <= 0:
         raise ValueError("A Weaver tree needs at least one drafted depth to grow.")
     coupling = self._gumbel_tree_inputs[bs] if self.use_gumbel_sampling else (None,) * 7
     separate_prune = self.use_gumbel_sampling and self.gumbel_prune_sigma_inv is not None
+    expand_head = (
+        expansion_head
+        if expansion_head is not None
+        else confidence_head if self.uzu_confidence_head_expand else None
+    )
+    expand_with_head = expand_head is not None
+    prune_with_head = confidence_head is not None and not separate_prune
     filter_temperatures = (
         self._draft_filter_temperatures[bs] if self.use_gumbel_sampling else None
     )
@@ -929,6 +1127,13 @@ def construct_uzu_tree(
     node_mask[:, 0] = True
     draft_logprobs[:, 0] = 0.0
     node_scores[:, 0] = 0.0
+    # Pool logits l = a + rho of every slot, for the confidence head; the publish kernel
+    # consumes them and keeps only the children.
+    slot_logits = (
+        None
+        if confidence_head is None and expansion_head is None
+        else torch.zeros((bs, num_nodes, pool_size), dtype=torch.float32, device=device)
+    )
 
     frontier_slots = num_nodes * expand_width
     batch_indices = torch.arange(bs, dtype=torch.long, device=device)
@@ -969,6 +1174,12 @@ def construct_uzu_tree(
     frontier_scores.fill_(-torch.inf)
     frontier_logprobs.fill_(-torch.inf)
     frontier_active.zero_()
+    if expand_with_head:
+        # The head reads every source each round: entries no publish has written yet must be
+        # well-formed absent sources, not uninitialised memory.
+        frontier_tokens.zero_()
+        frontier_parents.fill_(-1)
+        frontier_depths.zero_()
     selected_tokens = torch.empty(
         (bs, batch_expand_width), dtype=torch.long, device=device
     )
@@ -1179,12 +1390,94 @@ def construct_uzu_tree(
             internals.slot_states[:, slots] = states.view(bs, width, -1)
             internals.slot_residuals[:, slots] = residuals.view(bs, width, -1)
             internals.slot_logits[:, slots] = logits.float().view(bs, width, -1)
+        if slot_logits is not None:
+            slot_logits[:, slot_start : slot_start + width] = logits.float().view(
+                bs, width, -1
+            )
         return (
             logits.float(),
             row_candidate_ids,
             current_keys,
             current_values,
         )
+
+    gumbels = (
+        None
+        if confidence_head is None and expansion_head is None
+        else pool_gumbels(self, candidate_ids)
+    )
+
+    def head_inputs() -> TreeInputs:
+        """The tree grown so far as the head reads it."""
+        assert slot_logits is not None and gumbels is not None
+        return TreeInputs(
+            slot_logits=slot_logits,
+            pool_logits=candidate_scores,
+            pool_gumbels=gumbels,
+            pool_tokens=candidate_ids,
+            draft_hidden=proposal_features.reshape(bs, depth, -1),
+            tokens=torch.cat((tokens, frontier_tokens), dim=1),
+            parents=torch.cat((parents, frontier_parents), dim=1),
+            depths=torch.cat((depths, frontier_depths), dim=1),
+            present=torch.cat((node_mask, frontier_active), dim=1),
+        )
+
+    # The head's local part scores a child from its parent and the path alone, so a node keeps its
+    # log r as the tree grows and the last round's scores are those of the finished tree; for a head
+    # without tree attention they are its prune scores too.
+    head_log_r: torch.Tensor | None = None
+
+    def rescore_frontier() -> None:
+        nonlocal head_log_r
+        assert expand_head is not None
+        if self.uzu_confidence_head_expand_coverage and expansion_head is None:
+            head_log_r, priority = expand_head.expansion_scores(head_inputs())
+        else:
+            head_log_r = priority = expand_head.local_scores(head_inputs())
+        frontier_scores.copy_(priority[:, num_nodes:])
+
+    # The incremental path: the expanding head's local part only for the slots a round has just
+    # expanded, kept per slot for the prune (same scores as re-scoring the whole tree).
+    round_kernel = (
+        self.uzu_round_kernel
+        if self.uzu_round_kernel is not None
+        and expand_head is self.uzu_round_kernel.head
+        else None
+    )
+    if round_kernel is not None:
+        assert slot_logits is not None and gumbels is not None
+        # The kernel reads every pool tensor as dense [bs, depth, pool].
+        constants = round_kernel.head.step_constants(
+            candidate_scores.contiguous(),
+            gumbels,
+            candidate_ids.contiguous(),
+            proposal_features.reshape(bs, depth, -1),
+        )
+        state = RoundState.zeros(
+            bs, num_nodes, expand_width, round_kernel.weights.hidden, device
+        )
+
+    def rescore(slot_start: int, width: int) -> None:
+        """The frontier priority of the children a round has just published."""
+        if round_kernel is not None:
+            expand_round(
+                round_kernel.weights,
+                slot_start=slot_start,
+                width=width,
+                slot_logits=slot_logits,
+                pool_logits=constants.pool_logits,
+                pool_gumbels=constants.pool_gumbels,
+                pool_tokens=constants.pool_tokens,
+                draft_rows=constants.draft_rows,
+                depths=depths,
+                node_scores=node_scores,
+                frontier_tokens=frontier_tokens,
+                frontier_active=frontier_active,
+                frontier_scores=frontier_scores,
+                state=state,
+            )
+        elif expand_with_head:
+            rescore_frontier()
 
     root_parent_ancestors = torch.full(
         (bs, 1, depth), -1, dtype=torch.long, device=device
@@ -1219,6 +1512,7 @@ def construct_uzu_tree(
         0,
         1,
     )
+    rescore(0, 1)
 
     for round_index in range(1, shape.rounds):
         slot_start = 1 + (round_index - 1) * batch_expand_width
@@ -1269,7 +1563,8 @@ def construct_uzu_tree(
             slot_start,
             width,
         )
-    return UzuConstructedTree(
+        rescore(slot_start, width)
+    constructed = UzuConstructedTree(
         node_tokens=tokens,
         node_parents=parents,
         node_depths=depths,
@@ -1284,4 +1579,40 @@ def construct_uzu_tree(
         frontier_logprobs=frontier_logprobs,
         frontier_scores=frontier_scores,
         frontier_prune_scores=frontier_prune_scores,
+    )
+    if not prune_with_head:
+        return constructed
+    assert confidence_head is not None
+    if round_kernel is not None and confidence_head is round_kernel.head:
+        # The full head on what the rounds kept: no slot's pool or drafter row is read again.
+        scores = round_kernel.head.prune_expanded(
+            ExpandedTree(
+                slot_logits=slot_logits,
+                nodes=state.nodes,
+                children=state.children,
+                slots=state.slots,
+                child_indices=state.child_indices,
+                child_real=state.child_real,
+                child_positions=child_positions(
+                    tokens, parents, node_mask, frontier_tokens, expand_width
+                ),
+                tokens=torch.cat((tokens, frontier_tokens), dim=1),
+                parents=torch.cat((parents, frontier_parents), dim=1),
+                depths=torch.cat((depths, frontier_depths), dim=1),
+                present=torch.cat((node_mask, frontier_active), dim=1),
+            ),
+            constants,
+        )
+    elif (
+        head_log_r is not None
+        and expand_head is confidence_head
+        and confidence_head.tree is None
+    ):
+        scores = head_log_r
+    else:
+        scores = confidence_head.prune_scores(head_inputs())
+    return msgspec.structs.replace(
+        constructed,
+        node_prune_scores=scores[:, :num_nodes],
+        frontier_prune_scores=scores[:, num_nodes:],
     )

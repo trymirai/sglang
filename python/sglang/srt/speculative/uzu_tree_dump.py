@@ -41,17 +41,16 @@ from pathlib import Path
 import msgspec
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.speculative.dflash_tfm import WeaverTree
-from sglang.srt.speculative.shared_gumbel import filtered_probs, gumbel_at, sample_probs
+from sglang.srt.speculative.shared_gumbel import filtered_probs, sample_probs
 from sglang.srt.speculative.uzu_tree import (
     UzuConstructedTree,
     UzuTreeInternals,
     UzuTreeShape,
     check_uzu_tree_shape,
     construct_uzu_tree,
+    pool_gumbels,
 )
 
 # Target logits kept per verified node. The request filters of these runs (top-k 20 inside a
@@ -118,33 +117,6 @@ def _raw(tensor: torch.Tensor) -> np.ndarray:
     if tensor.dtype == torch.bfloat16:
         return tensor.contiguous().view(torch.int16).to("cpu").numpy().view(np.uint16)
     return tensor.to("cpu", torch.float32).numpy()
-
-
-@triton.jit
-def _pool_gumbel_kernel(
-    noise_ptr, tokens_ptr, seeds_ptr, positions_ptr, POOL: tl.constexpr, BLOCK: tl.constexpr
-):
-    # One program per pool row d of request 0. The children of a node at depth d come from pool
-    # row d and draw the field at the node's position, the root position plus d, exactly as the
-    # publish kernel does; slots without a token read token -1 there too.
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    mask = offsets < POOL
-    tokens = tl.load(tokens_ptr + row * POOL + offsets, mask=mask, other=-1)
-    noise = gumbel_at(tl.load(seeds_ptr), tl.load(positions_ptr) + row, tokens)
-    tl.store(noise_ptr + row * POOL + offsets, noise, mask=mask)
-
-
-def _pool_gumbel(worker, candidate_ids: torch.Tensor) -> torch.Tensor:
-    """The shared Gumbel field on the candidate pool of every depth, as the tree kernel saw it."""
-    seeds, positions = worker._gumbel_tree_inputs[1][:2]
-    rows = candidate_ids[0].contiguous()
-    noise = torch.empty(rows.shape, dtype=torch.float32, device=rows.device)
-    _pool_gumbel_kernel[(rows.shape[0],)](
-        noise, rows, seeds, positions, POOL=int(rows.shape[1]),
-        BLOCK=int(triton.next_power_of_2(rows.shape[1])),
-    )
-    return noise
 
 
 def _draft_vocab_logits(lm_head, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -237,7 +209,7 @@ def _tree_record(
         "pool_tokens": candidate_ids.to("cpu", torch.int32).numpy(),
         "pool_logits": _bf16_words(inputs["candidate_scores"][0], "the drafter's pool logits"),
         "pool_log_norms": _raw(torch.logsumexp(vocab_logits, dim=-1)),
-        "pool_gumbels": _raw(_pool_gumbel(worker, inputs["candidate_ids"])),
+        "pool_gumbels": _raw(pool_gumbels(worker, inputs["candidate_ids"])[0]),
         "rho": _bf16_words(internals.slot_residuals[0][expanded_slots], "the Weaver residual logits"),
         "state": _raw(internals.slot_states[0][expanded_slots]),
         "draft_h": _raw(proposal_features[0]),
@@ -302,6 +274,27 @@ class UzuTreeDumper:
             "draft_top_p": float(worker.draft_top_p),
             "draft_min_p": float(worker.draft_min_p),
             "internals": internals,
+            # The confidence head, or None: it ranks the prune unless prune_sigma_inv is set, and
+            # with confidence_head_expand it also sets the expansion priority (log r, or with
+            # confidence_head_expand_coverage log r + log kappa).
+            "confidence_head": (
+                None
+                if worker.uzu_confidence_head is None
+                else worker.uzu_confidence_head.source
+            ),
+            "confidence_head_expand": bool(worker.uzu_confidence_head_expand),
+            "confidence_head_expand_coverage": bool(
+                worker.uzu_confidence_head_expand_coverage
+            ),
+            # A separate head that sets the expansion priority (its local log r), or None.
+            "expansion_head": (
+                None
+                if worker.uzu_expansion_head is None
+                else worker.uzu_expansion_head.source
+            ),
+            # The expanding head's local part runs incrementally (the fused round kernel, the prune
+            # on the kept parts) rather than over the whole tree after every round.
+            "incremental_head": worker.uzu_round_kernel is not None,
         }
         if internals:
             self.meta["target_top_k"] = TARGET_TOP_K
@@ -329,7 +322,13 @@ class UzuTreeDumper:
                 "The uzu tree dump saw two tree builds without a verify between them."
             )
         with torch.inference_mode():
-            served = construct_uzu_tree(worker, **inputs, shape=self.served_shape)
+            served = construct_uzu_tree(
+                worker,
+                **inputs,
+                shape=self.served_shape,
+                confidence_head=worker.uzu_confidence_head,
+                expansion_head=worker.uzu_expansion_head,
+            )
             arrays = _constructed_arrays("served", served)
             arrays |= _pruned_arrays("served_pruned", served_tree)
             # The eager rebuild must prune to exactly the tree the graph handed to the verifier,
@@ -367,7 +366,12 @@ class UzuTreeDumper:
                 dtype=inputs["candidate_weights"].dtype,
             )
             constructed = construct_uzu_tree(
-                worker, **inputs, shape=self.served_shape, internals=internals
+                worker,
+                **inputs,
+                shape=self.served_shape,
+                internals=internals,
+                confidence_head=worker.uzu_confidence_head,
+                expansion_head=worker.uzu_expansion_head,
             )
             tree, sources = constructed.prune_with_sources(self.final_num_nodes)
             arrays = _tree_record(
