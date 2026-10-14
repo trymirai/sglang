@@ -1677,6 +1677,26 @@ class ServerArgs:
         "tree is built once, eagerly, and that tree is verified. Needs --disable-overlap-schedule, "
         "so that no step is drafted past the end of a request.",
     ] = False
+    speculative_dflash_tfm_uzu_tree_dump_plain_check: A[
+        bool,
+        "weaver_uzu, with --speculative-dflash-tfm-uzu-tree-dump-internals only, diagnostic. On "
+        "every step also grow the served tree with the plain Weaver step the CUDA graph runs, on "
+        "the same inputs, and record whether its pruned tree equals the verified one and the "
+        "largest difference of their prune scores.",
+    ] = False
+    speculative_dflash_tfm_uzu_tree_dump_graph: A[
+        bool,
+        "weaver_uzu, with --speculative-dflash-tfm-uzu-tree-dump-internals only. Build the served "
+        "tree with its internals, the pool Gumbel field and the drafter's log-normaliser as one CUDA "
+        "graph, copy its outputs to pinned host buffers without blocking and write each step from a "
+        "background thread. The dumped steps are the same as without it; a step file appears under "
+        "its final name once complete.",
+    ] = False
+    speculative_dflash_tfm_uzu_tree_dump_graph_check: A[
+        bool,
+        "weaver_uzu, with --speculative-dflash-tfm-uzu-tree-dump-graph only, diagnostic. On every "
+        "step also build the eager internals record and fail on any difference from the graph's.",
+    ] = False
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
@@ -7230,6 +7250,41 @@ class ServerArgs:
             raise ValueError(
                 "--speculative-dflash-tfm-uzu-tree-dump-internals needs "
                 "--speculative-dflash-tfm-uzu-tree-dump-dir: the internals are only dumped."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_plain_check
+            and not self.speculative_dflash_tfm_uzu_tree_dump_internals
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-plain-check needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-internals: it compares the internals "
+                "tree with the plain one."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_graph
+            and not self.speculative_dflash_tfm_uzu_tree_dump_internals
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-graph needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-internals: it is that dump under a CUDA "
+                "graph."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_graph
+            and self.speculative_dflash_tfm_uzu_tree_dump_plain_check
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-plain-check runs with the eager internals "
+                "dump only, not with --speculative-dflash-tfm-uzu-tree-dump-graph."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_graph_check
+            and not self.speculative_dflash_tfm_uzu_tree_dump_graph
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-graph-check needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-graph: it compares the graph dump with "
+                "the eager one."
             )
         if (
             self.speculative_dflash_tfm_uzu_tree_dump_internals

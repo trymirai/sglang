@@ -30,12 +30,24 @@ since numpy has no bfloat16.
 
 Diagnostic only: one request at a time (--max-running-requests 1), every step pays several extra
 tree builds and a device-to-host copy.
+
+With --speculative-dflash-tfm-uzu-tree-dump-graph the internals dump is fast enough to collect
+with: the served tree with its internals, the pool Gumbel field and the drafter's log-normaliser
+are one CUDA graph, its outputs are copied without blocking into pinned host buffers, and a
+background thread turns them into the very same step record (see _host_tree_record) and writes
+it. The decode loop never waits for the host. A step file appears under its final name only once
+it is complete, possibly a little after the request returns; the reader waits for the count of
+steps the server reports. --speculative-dflash-tfm-uzu-tree-dump-graph-check also builds the eager
+record on every step and fails on any difference.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import queue
+import threading
 from pathlib import Path
 
 import msgspec
@@ -204,13 +216,19 @@ def _tree_record(
         "round": rounds.to("cpu", torch.uint8).numpy(),
         "edge_logprob": _raw(take(tree.node_logprobs, tree.frontier_logprobs).float()),
         "priority": _raw(take(tree.node_scores, tree.frontier_scores).float()),
-        "prune_score": _raw(take(tree.node_prune_scores, tree.frontier_prune_scores).float()),
+        "prune_score": _raw(
+            take(tree.node_prune_scores, tree.frontier_prune_scores).float()
+        ),
         "verified": verified.to("cpu", torch.int16).numpy(),
         "pool_tokens": candidate_ids.to("cpu", torch.int32).numpy(),
-        "pool_logits": _bf16_words(inputs["candidate_scores"][0], "the drafter's pool logits"),
+        "pool_logits": _bf16_words(
+            inputs["candidate_scores"][0], "the drafter's pool logits"
+        ),
         "pool_log_norms": _raw(torch.logsumexp(vocab_logits, dim=-1)),
         "pool_gumbels": _raw(pool_gumbels(worker, inputs["candidate_ids"])[0]),
-        "rho": _bf16_words(internals.slot_residuals[0][expanded_slots], "the Weaver residual logits"),
+        "rho": _bf16_words(
+            internals.slot_residuals[0][expanded_slots], "the Weaver residual logits"
+        ),
         "state": _raw(internals.slot_states[0][expanded_slots]),
         "draft_h": _raw(proposal_features[0]),
         "target_h": _raw(inputs["output_norm"][0]),
@@ -246,11 +264,252 @@ def _target_record(
     }
 
 
+# Steps recorded but not yet written: the decode loop waits for the writer only this far behind.
+GRAPH_SLOTS = 4
+DEVIATION_LIMIT = 1e-5
+
+
+class _GraphTree(msgspec.Struct):
+    """The served tree with its internals as one CUDA graph: static inputs and outputs."""
+
+    graph: torch.cuda.CUDAGraph
+    inputs: dict[str, torch.Tensor]
+    constructed: UzuConstructedTree
+    tree: WeaverTree
+    sources: torch.Tensor
+    internals: UzuTreeInternals
+    gumbels: torch.Tensor
+    log_norms: torch.Tensor
+
+
+class _GraphItem(msgspec.Struct):
+    """One step on its way to the writer: its pinned slot and the event its copies end at."""
+
+    slot: int
+    event: torch.cuda.Event
+    rid: str
+    root_position: int
+    num_accept: int
+
+
+def _tree_device_fields(state: _GraphTree) -> dict[str, torch.Tensor]:
+    """The device tensors a step record is built from, request 0."""
+    fields = {
+        f"node_{name}": getattr(state.constructed, f"node_{name}")[0]
+        for name in (
+            "tokens",
+            "parents",
+            "depths",
+            "mask",
+            "logprobs",
+            "scores",
+            "prune_scores",
+        )
+    }
+    fields |= {
+        f"frontier_{name}": getattr(state.constructed, f"frontier_{name}")[0]
+        for name in (
+            "tokens",
+            "parents",
+            "depths",
+            "active",
+            "logprobs",
+            "scores",
+            "prune_scores",
+        )
+    }
+    return fields | {
+        "sources": state.sources[0],
+        "candidate_ids": state.inputs["candidate_ids"][0],
+        "candidate_scores": state.inputs["candidate_scores"][0],
+        "proposal_features": state.inputs["proposal_features"][0],
+        "output_norm": state.inputs["output_norm"][0],
+        "slot_residuals": state.internals.slot_residuals[0],
+        "slot_states": state.internals.slot_states[0],
+        "gumbels": state.gumbels[0],
+        "log_norms": state.log_norms,
+    }
+
+
+def _target_device_fields(
+    logits: torch.Tensor, sampling_info, positions: torch.Tensor, num_nodes: int
+) -> dict[str, torch.Tensor]:
+    """The target's record at every verified node, on the device (see _target_record)."""
+    logits = logits.view(-1, logits.shape[-1])[:num_nodes]
+    top = torch.topk(logits.float(), TARGET_TOP_K, dim=-1)
+    probs = filtered_probs(logits, sampling_info, repeats=num_nodes)
+    seeds = sampling_info.sampling_seed.repeat_interleave(num_nodes)
+    choices = sample_probs(probs, seeds, positions.reshape(-1)[:num_nodes])
+    filtered = probs.gather(1, top.indices)
+    return {
+        "top_indices": top.indices,
+        "top_values": top.values,
+        "log_norm": torch.logsumexp(logits.float(), dim=-1),
+        "filtered": filtered.float(),
+        "choices": choices,
+        "deviation": (1.0 - filtered.sum(dim=-1)).abs().max(),
+    }
+
+
+def _host(tensor: torch.Tensor) -> np.ndarray:
+    """A pinned host tensor as an owned numpy array; bf16 as its raw 16-bit patterns."""
+    if tensor.dtype == torch.bfloat16:
+        return tensor.view(torch.int16).numpy().view(np.uint16).copy()
+    return tensor.numpy().copy()
+
+
+def _host_bf16_words(values: np.ndarray, field: str) -> np.ndarray:
+    """fp32 values that must be bf16 exactly, as raw bf16 words (as _bf16_words on the device)."""
+    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32)
+    if np.isnan(values).any() or np.any(bits & np.uint32(0xFFFF)):
+        raise RuntimeError(
+            f"The uzu tree dump expected {field} to hold bf16 values exactly."
+        )
+    return (bits >> np.uint32(16)).astype(np.uint16)
+
+
+def _host_tree_record(
+    host: dict[str, np.ndarray], shape: UzuTreeShape, max_depth: int
+) -> dict[str, np.ndarray]:
+    """_tree_record on host copies of the graph's outputs: the same arrays, bit for bit."""
+    num_slots = int(host["node_mask"].shape[0])
+    present = np.concatenate((host["node_mask"], host["frontier_active"]))
+    s_sources = np.flatnonzero(present)
+    s_of_source = np.full(present.size, -1, dtype=np.int64)
+    s_of_source[s_sources] = np.arange(s_sources.size)
+    take = lambda name: np.concatenate(
+        (host[f"node_{name}"], host[f"frontier_{name}"])
+    )[s_sources]
+    parent_sources = take("parents")
+    parents = np.where(
+        parent_sources >= 0, s_of_source[np.maximum(parent_sources, 0)], -1
+    )
+    depths = take("depths").astype(np.int64)
+    tokens = take("tokens").astype(np.int64)
+    candidate_ids = host["candidate_ids"]
+    hits = candidate_ids[depths[1:] - 1] == tokens[1:, None]
+    if not np.all(hits.sum(axis=1) == 1):
+        raise RuntimeError(
+            "The uzu tree dump found a node token not exactly once in its pool row."
+        )
+    pool_index = np.concatenate(([0], hits.argmax(axis=1)))
+    width = int(shape.parents_per_round)
+    rounds = np.where(
+        s_sources < num_slots,
+        np.where(s_sources == 0, 0, 1 + np.maximum(s_sources - 1, 0) // width),
+        NOT_EXPANDED,
+    )
+    kept = host["sources"]
+    verified = np.where(present[kept], s_of_source[kept], -1)
+    expanded_slots = s_sources[(s_sources < num_slots) & (depths < max_depth)]
+    return {
+        "root_token": np.asarray(tokens[0], dtype=np.int32),
+        "parent": parents.astype(np.int16),
+        "depth": depths.astype(np.uint8),
+        "pool_index": pool_index.astype(np.int16),
+        "round": rounds.astype(np.uint8),
+        "edge_logprob": take("logprobs").astype(np.float32),
+        "priority": take("scores").astype(np.float32),
+        "prune_score": take("prune_scores").astype(np.float32),
+        "verified": verified.astype(np.int16),
+        "pool_tokens": candidate_ids.astype(np.int32),
+        "pool_logits": _host_bf16_words(
+            host["candidate_scores"], "the drafter's pool logits"
+        ),
+        "pool_log_norms": host["log_norms"].astype(np.float32),
+        "pool_gumbels": host["gumbels"].astype(np.float32),
+        "rho": _host_bf16_words(
+            host["slot_residuals"][expanded_slots], "the Weaver residual logits"
+        ),
+        "state": host["slot_states"][expanded_slots],
+        "draft_h": host["proposal_features"],
+        "target_h": host["output_norm"],
+    }
+
+
+def _host_target_record(host: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """_target_record on host copies of _target_device_fields."""
+    if float(host["deviation"]) > DEVIATION_LIMIT:
+        raise RuntimeError(
+            f"The target's filtered distribution leaves its top {TARGET_TOP_K} tokens; raise TARGET_TOP_K."
+        )
+    return {
+        "target_top_tokens": host["top_indices"].astype(np.int32),
+        "target_top_logits": host["top_values"].astype(np.float32),
+        "target_log_norm": host["log_norm"].astype(np.float32),
+        "target_filtered": host["filtered"].astype(np.float32),
+        "target_choice": host["choices"].astype(np.int32),
+    }
+
+
+# The target filters (top-p, top-k renormalisation kernels) are not bitwise deterministic: on the
+# same probabilities, 18 of 20 calls differed from the first by up to 3e-8 with the same support.
+# The graph check compares the filtered distribution to this bound and its support exactly.
+FILTERED_TOLERANCE = 1e-6
+
+
+def _same_target(
+    left: dict[str, np.ndarray], right: dict[str, np.ndarray]
+) -> str | None:
+    """_same_arrays for the target record, target_filtered compared up to FILTERED_TOLERANCE."""
+    rest = lambda record: {k: v for k, v in record.items() if k != "target_filtered"}
+    differs = _same_arrays(rest(left), rest(right))
+    if differs is not None:
+        return differs
+    a, b = left["target_filtered"], right["target_filtered"]
+    if a.shape != b.shape or not np.array_equal(a > 0, b > 0):
+        return "target_filtered support"
+    if np.abs(a.astype(np.float64) - b).max(initial=0.0) > FILTERED_TOLERANCE:
+        return "target_filtered"
+    return None
+
+
+def _same_arrays(
+    left: dict[str, np.ndarray], right: dict[str, np.ndarray]
+) -> str | None:
+    """The first field where two records differ (in keys, dtype, shape or bits), None if none."""
+    if left.keys() != right.keys():
+        return f"fields {sorted(left.keys() ^ right.keys())}"
+    for name in sorted(left):
+        a, b = np.asarray(left[name]), np.asarray(right[name])
+        if a.dtype != b.dtype or a.shape != b.shape or a.tobytes() != b.tobytes():
+            return name
+    return None
+
+
 class UzuTreeDumper:
+
     def __init__(
-        self, worker, dump_dir: str, shapes_spec: str | None, internals: bool = False
+        self,
+        worker,
+        dump_dir: str,
+        shapes_spec: str | None,
+        internals: bool = False,
+        plain_check: bool = False,
+        graph: bool = False,
+        graph_check: bool = False,
     ) -> None:
+        if graph and not internals:
+            raise RuntimeError(
+                "The graph dump is the internals dump built under a CUDA graph."
+            )
+        if graph and plain_check:
+            raise RuntimeError(
+                "The plain check runs with the eager internals dump only."
+            )
         self.internals = internals
+        self.plain_check = plain_check
+        self.graph = graph
+        self.graph_check = graph_check
+        self._graph_tree: _GraphTree | None = None
+        self._slots: list[dict[str, torch.Tensor]] = []
+        self._free_slots: queue.Queue[int] = queue.Queue()
+        self._writes: queue.Queue[_GraphItem | None] = queue.Queue()
+        self._writer: threading.Thread | None = None
+        self._writer_error: BaseException | None = None
+        self._pending_graph: (
+            tuple[int, str, int, dict[str, np.ndarray] | None] | None
+        ) = None
         self.dump_dir = Path(dump_dir)
         self.dump_dir.mkdir(parents=True, exist_ok=True)
         self.served_shape = UzuTreeShape.from_worker(worker)
@@ -274,6 +533,7 @@ class UzuTreeDumper:
             "draft_top_p": float(worker.draft_top_p),
             "draft_min_p": float(worker.draft_min_p),
             "internals": internals,
+            "plain_check": plain_check,
             # The confidence head, or None: it ranks the prune unless prune_sigma_inv is set, and
             # with confidence_head_expand it also sets the expansion priority (log r, or with
             # confidence_head_expand_coverage log r + log kappa).
@@ -298,9 +558,15 @@ class UzuTreeDumper:
         }
         if internals:
             self.meta["target_top_k"] = TARGET_TOP_K
+            self.meta["graph"] = graph
+        self.max_depth = int(worker.tree_max_depth)
         self._request_dirs: dict[str, Path] = {}
         self._step_counts: dict[str, int] = {}
         self._pending: _PendingStep | None = None
+        if graph:
+            self._slots = [{} for _ in range(GRAPH_SLOTS)]
+            for slot in range(GRAPH_SLOTS):
+                self._free_slots.put(slot)
 
     def record_build(
         self,
@@ -351,9 +617,13 @@ class UzuTreeDumper:
             raise RuntimeError("build_served is the internals dump; use record_build without it.")
         if int(inputs["candidate_ids"].shape[0]) != 1:
             raise RuntimeError("The uzu tree dump supports one request per step only.")
-        if self._pending is not None:
+        if self._pending is not None or self._pending_graph is not None:
             raise RuntimeError(
                 "The uzu tree dump saw two tree builds without a verify between them."
+            )
+        if self.graph:
+            return self._build_served_graph(
+                worker, rid=rid, root_position=root_position, inputs=inputs
             )
         with torch.inference_mode():
             candidate_ids = inputs["candidate_ids"]
@@ -383,9 +653,53 @@ class UzuTreeDumper:
                 self.served_shape,
                 int(worker.tree_max_depth),
             )
+            if self.plain_check:
+                arrays |= self._plain_check(worker, inputs, constructed, tree)
         arrays["root_position"] = np.array(root_position, dtype=np.int64)
         self._pending = _PendingStep(rid=rid, arrays=arrays)
         return tree
+
+    def _plain_check(
+        self,
+        worker,
+        inputs: dict[str, torch.Tensor],
+        constructed: UzuConstructedTree,
+        tree: WeaverTree,
+    ) -> dict[str, np.ndarray]:
+        """The same step grown with the plain Weaver step the CUDA graph runs: whether its
+        pruned tree is the verified one, and the largest prune-score difference over the
+        sources present in both (inf if the construction differs)."""
+        plain = construct_uzu_tree(
+            worker,
+            **inputs,
+            shape=self.served_shape,
+            confidence_head=worker.uzu_confidence_head,
+            expansion_head=worker.uzu_expansion_head,
+        )
+        present = torch.cat((constructed.node_mask[0], constructed.frontier_active[0]))
+        same_nodes = bool(
+            torch.equal(
+                present, torch.cat((plain.node_mask[0], plain.frontier_active[0]))
+            )
+            and torch.equal(constructed.node_tokens, plain.node_tokens)
+            and torch.equal(constructed.frontier_tokens, plain.frontier_tokens)
+        )
+        error = float("inf")
+        if same_nodes:
+            served = torch.cat(
+                (constructed.node_prune_scores[0], constructed.frontier_prune_scores[0])
+            )
+            other = torch.cat(
+                (plain.node_prune_scores[0], plain.frontier_prune_scores[0])
+            )
+            error = float((served - other)[present].abs().max())
+        return {
+            "plain_tree_match": np.array(
+                _same_tree(plain.prune(self.final_num_nodes), tree)
+            ),
+            "plain_same_nodes": np.array(same_nodes),
+            "plain_prune_score_err": np.array(error, dtype=np.float32),
+        }
 
     def record_accept(
         self,
@@ -399,6 +713,14 @@ class UzuTreeDumper:
 
         With internals the verifier's logits, sampling info and node positions are needed too.
         """
+        if self.graph:
+            if logits is None or sampling_info is None or positions is None:
+                raise RuntimeError(
+                    "The uzu tree dump with internals needs the verifier's logits, "
+                    "sampling info and node positions."
+                )
+            self._record_accept_graph(accept_tokens, logits, sampling_info, positions)
+            return
         pending = self._pending
         if pending is None:
             raise RuntimeError("The uzu tree dump saw a verify without a recorded tree build.")
@@ -418,6 +740,269 @@ class UzuTreeDumper:
         step = self._step_counts[pending.rid]
         self._step_counts[pending.rid] = step + 1
         np.savez(request_dir / f"{step:06d}.npz", **pending.arrays)
+
+    def _eager_served(
+        self, worker, inputs: dict[str, torch.Tensor]
+    ) -> tuple[WeaverTree, dict[str, np.ndarray]]:
+        """The eager internals build of build_served: its pruned tree and its step record."""
+        candidate_ids = inputs["candidate_ids"]
+        internals = UzuTreeInternals.empty(
+            1,
+            self.served_shape.num_slots,
+            int(worker.weaver.d_rank),
+            int(candidate_ids.shape[2]),
+            device=candidate_ids.device,
+            dtype=inputs["candidate_weights"].dtype,
+        )
+        constructed = construct_uzu_tree(
+            worker,
+            **inputs,
+            shape=self.served_shape,
+            internals=internals,
+            confidence_head=worker.uzu_confidence_head,
+            expansion_head=worker.uzu_expansion_head,
+        )
+        tree, sources = constructed.prune_with_sources(self.final_num_nodes)
+        record = _tree_record(
+            worker,
+            inputs,
+            constructed,
+            sources,
+            internals,
+            self.served_shape,
+            self.max_depth,
+        )
+        return tree, record
+
+    def _capture(self, worker, inputs: dict[str, torch.Tensor]) -> _GraphTree:
+        """Capture the served tree with its internals, the pool Gumbel field and the drafter's
+        log-normaliser as one graph, after an eager warm-up run on the same static buffers.
+        """
+        static = {
+            name: torch.empty_like(value)
+            for name, value in inputs.items()
+            if name != "token_embed"
+        }
+        for name, buffer in static.items():
+            buffer.copy_(inputs[name])
+        token_embed = inputs["token_embed"]
+        candidate_ids = static["candidate_ids"]
+        depth = int(candidate_ids.shape[1])
+        internals = UzuTreeInternals.empty(
+            1,
+            self.served_shape.num_slots,
+            int(worker.weaver.d_rank),
+            int(candidate_ids.shape[2]),
+            device=candidate_ids.device,
+            dtype=static["candidate_weights"].dtype,
+        )
+        _, lm_head = worker._target_embedding_and_lm_head()
+
+        def run():
+            constructed = construct_uzu_tree(
+                worker,
+                **static,
+                token_embed=token_embed,
+                shape=self.served_shape,
+                internals=internals,
+                confidence_head=worker.uzu_confidence_head,
+                expansion_head=worker.uzu_expansion_head,
+            )
+            tree, sources = constructed.prune_with_sources(self.final_num_nodes)
+            features = static["proposal_features"]
+            log_norms = torch.logsumexp(
+                _draft_vocab_logits(
+                    lm_head, features[0].reshape(depth, features.shape[-1])
+                ),
+                dim=-1,
+            )
+            return (
+                constructed,
+                tree,
+                sources,
+                pool_gumbels(worker, candidate_ids),
+                log_norms,
+            )
+
+        run()
+        torch.cuda.synchronize(candidate_ids.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            constructed, tree, sources, gumbels, log_norms = run()
+        torch.cuda.synchronize(candidate_ids.device)
+        return _GraphTree(
+            graph=graph,
+            inputs=static | {"token_embed": token_embed},
+            constructed=constructed,
+            tree=tree,
+            sources=sources,
+            internals=internals,
+            gumbels=gumbels,
+            log_norms=log_norms,
+        )
+
+    def _graph_for(self, worker, inputs: dict[str, torch.Tensor]) -> _GraphTree:
+        state = self._graph_tree
+        if state is None:
+            state = self._graph_tree = self._capture(worker, inputs)
+            return state
+        if inputs["token_embed"].data_ptr() != state.inputs[
+            "token_embed"
+        ].data_ptr() or any(
+            state.inputs[name].shape != value.shape
+            or state.inputs[name].dtype != value.dtype
+            for name, value in inputs.items()
+        ):
+            raise RuntimeError(
+                "The uzu tree dump graph saw inputs of another shape or embedding."
+            )
+        return state
+
+    def _raise_writer_error(self) -> None:
+        if self._writer_error is not None:
+            raise RuntimeError(
+                "The uzu tree dump writer failed."
+            ) from self._writer_error
+
+    def _pinned(self, slot: int, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        buffers = self._slots[slot]
+        if name not in buffers:
+            buffers[name] = torch.empty(
+                tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+            )
+        return buffers[name]
+
+    def _acquire_slot(self) -> int:
+        while True:
+            self._raise_writer_error()
+            try:
+                return self._free_slots.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+    def _build_served_graph(
+        self, worker, *, rid: str, root_position: int, inputs: dict[str, torch.Tensor]
+    ) -> WeaverTree:
+        """The served tree from the graph; its record is copied to a pinned slot without blocking."""
+        self._raise_writer_error()
+        with torch.inference_mode():
+            state = self._graph_for(worker, inputs)
+            for name, buffer in state.inputs.items():
+                if name != "token_embed":
+                    buffer.copy_(inputs[name])
+            state.graph.replay()
+            slot = self._acquire_slot()
+            for name, tensor in _tree_device_fields(state).items():
+                self._pinned(slot, name, tensor).copy_(tensor, non_blocking=True)
+            check = None
+            if self.graph_check:
+                torch.cuda.synchronize(state.tree.draft_tokens.device)
+                host = {
+                    name: _host(self._slots[slot][name])
+                    for name in _tree_device_fields(state)
+                }
+                graph_record = _host_tree_record(
+                    host, self.served_shape, self.max_depth
+                )
+                eager_tree, eager_record = self._eager_served(worker, inputs)
+                differs = _same_arrays(graph_record, eager_record)
+                if differs is not None or not _same_tree(eager_tree, state.tree):
+                    raise RuntimeError(
+                        f"The graph dump differs from the eager one in {differs or 'the tree'}."
+                    )
+                check = eager_record
+        self._pending_graph = (slot, rid, root_position, check)
+        return state.tree
+
+    def _record_accept_graph(
+        self,
+        accept_tokens: torch.Tensor,
+        logits: torch.Tensor,
+        sampling_info,
+        positions: torch.Tensor,
+    ) -> None:
+        self._raise_writer_error()
+        if self._pending_graph is None:
+            raise RuntimeError(
+                "The uzu tree dump saw a verify without a recorded tree build."
+            )
+        slot, rid, root_position, check = self._pending_graph
+        self._pending_graph = None
+        with torch.inference_mode():
+            target = _target_device_fields(
+                logits, sampling_info, positions, self.final_num_nodes
+            )
+            for name, tensor in target.items():
+                self._pinned(slot, f"target_{name}", tensor).copy_(
+                    tensor, non_blocking=True
+                )
+            count = int(accept_tokens.numel())
+            buffer = self._pinned(
+                slot,
+                "accept_tokens",
+                torch.empty(self.final_num_nodes + 1, dtype=accept_tokens.dtype),
+            )
+            buffer[:count].copy_(accept_tokens, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            if check is not None:
+                event.synchronize()
+                host = {
+                    name: _host(self._slots[slot][f"target_{name}"]) for name in target
+                }
+                eager = _target_record(
+                    logits, sampling_info, positions, self.final_num_nodes
+                )
+                differs = _same_target(_host_target_record(host), eager)
+                if differs is not None:
+                    raise RuntimeError(
+                        f"The graph dump differs from the eager one in {differs}."
+                    )
+        if self._writer is None:
+            self._writer = threading.Thread(
+                target=self._write_loop, name="uzu-tree-dump-writer", daemon=True
+            )
+            self._writer.start()
+        self._writes.put(_GraphItem(slot, event, rid, root_position, count))
+
+    def _write_loop(self) -> None:
+        """Wait for each step's copies, build its record on the host and write it."""
+        try:
+            while (item := self._writes.get()) is not None:
+                item.event.synchronize()
+                buffers = self._slots[item.slot]
+                tree = {
+                    name: _host(tensor)
+                    for name, tensor in buffers.items()
+                    if not name.startswith("target_") and name != "accept_tokens"
+                }
+                target = {
+                    name.removeprefix("target_"): _host(tensor)
+                    for name, tensor in buffers.items()
+                    if name.startswith("target_")
+                }
+                accept = _host(buffers["accept_tokens"])[: item.num_accept].astype(
+                    np.int32
+                )
+                self._free_slots.put(item.slot)
+                arrays = _host_tree_record(tree, self.served_shape, self.max_depth)
+                arrays["root_position"] = np.array(item.root_position, dtype=np.int64)
+                arrays["accept_tokens"] = accept
+                arrays |= _host_target_record(target)
+                self._write_step(item.rid, arrays)
+        except BaseException as error:  # noqa: BLE001 - surfaced on the next dump call
+            self._writer_error = error
+
+    def _write_step(self, rid: str, arrays: dict[str, np.ndarray]) -> None:
+        """One step file, visible under its final name only once complete."""
+        request_dir = self._request_dir(rid)
+        step = self._step_counts[rid]
+        self._step_counts[rid] = step + 1
+        path = request_dir / f"{step:06d}.npz"
+        partial = path.with_name(path.name + ".part")
+        with partial.open("wb") as handle:
+            np.savez(handle, **arrays)
+        os.replace(partial, path)
 
     def _request_dir(self, rid: str) -> Path:
         if rid not in self._request_dirs:

@@ -2824,6 +2824,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 tree_dump_dir,
                 self.server_args.speculative_dflash_tfm_uzu_tree_dump_shapes,
                 internals=self.server_args.speculative_dflash_tfm_uzu_tree_dump_internals,
+                plain_check=(
+                    self.server_args.speculative_dflash_tfm_uzu_tree_dump_plain_check
+                ),
+                graph=self.server_args.speculative_dflash_tfm_uzu_tree_dump_graph,
+                graph_check=(
+                    self.server_args.speculative_dflash_tfm_uzu_tree_dump_graph_check
+                ),
             )
         if get_tp_group().world_size != 1:
             raise NotImplementedError(
