@@ -1706,6 +1706,12 @@ class ServerArgs:
         "weaver_uzu, with --speculative-dflash-tfm-uzu-tree-dump-graph only, diagnostic. On every "
         "step also build the eager internals record and fail on any difference from the graph's.",
     ] = False
+    speculative_dflash_tfm_uzu_tree_dump_context: A[
+        bool,
+        "weaver_uzu, with --speculative-dflash-tfm-uzu-tree-dump-internals only. Also write, per request, the "
+        "drafter's context rows hidden_norm(fc(target features)) as they enter its KV cache, with their positions "
+        "(context/<n>.npz next to the steps), so that the drafter can be replayed offline.",
+    ] = False
     speculative_dflash_tfm_path: A[
         Optional[str],
         "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
@@ -7303,6 +7309,14 @@ class ServerArgs:
                 "--speculative-dflash-tfm-uzu-tree-dump-graph-check needs "
                 "--speculative-dflash-tfm-uzu-tree-dump-graph: it compares the graph dump with "
                 "the eager one."
+            )
+        if (
+            self.speculative_dflash_tfm_uzu_tree_dump_context
+            and not self.speculative_dflash_tfm_uzu_tree_dump_internals
+        ):
+            raise ValueError(
+                "--speculative-dflash-tfm-uzu-tree-dump-context needs "
+                "--speculative-dflash-tfm-uzu-tree-dump-internals."
             )
         if (
             self.speculative_dflash_tfm_uzu_tree_dump_internals

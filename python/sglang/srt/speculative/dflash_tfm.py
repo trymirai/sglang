@@ -2828,6 +2828,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     self.server_args.speculative_dflash_tfm_uzu_tree_dump_plain_check
                 ),
                 graph=self.server_args.speculative_dflash_tfm_uzu_tree_dump_graph,
+                context=self.server_args.speculative_dflash_tfm_uzu_tree_dump_context,
                 graph_check=(
                     self.server_args.speculative_dflash_tfm_uzu_tree_dump_graph_check
                 ),
@@ -4426,6 +4427,20 @@ class DFlashTfmWorker(DFlashWorkerV2):
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
+    def _dump_context(self, batch, target_hidden, positions, commit_lens) -> None:
+        """With the tree dump's context option: the drafter's projection hidden_norm(fc(features)) of the context
+        rows about to enter the draft KV cache, with their positions, for replaying the drafter offline. The dump runs
+        one request at a time; with commit_lens only its committed prefix enters the cache."""
+        dumper = self.uzu_tree_dumper
+        if dumper is None or not dumper.context or target_hidden is None or target_hidden.numel() == 0:
+            return
+        if commit_lens is not None:
+            keep = int(commit_lens[0])
+            target_hidden, positions = target_hidden[:keep], positions.reshape(-1)[:keep]
+        with torch.inference_mode():
+            rows = self.draft_model.project_target_hidden(target_hidden)
+        dumper.add_context(batch.reqs[0].rid, rows, positions.reshape(-1))
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -4472,6 +4487,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 extend_seq_lens,
                 int(sum(batch.extend_lens)),
             )
+            self._dump_context(batch, split.target_hidden, positions, None)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=split.target_hidden,
                 cache_loc=batch.out_cache_loc,
@@ -4634,6 +4650,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 logits_output.hidden_states, self.hidden_size
             )
             cache_loc_2d = batch.out_cache_loc.view(bs, draft_token_num)
+            self._dump_context(
+                batch,
+                split.target_hidden.reshape(-1, split.target_hidden.shape[-1]),
+                verify_input.positions,
+                commit_lens,
+            )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=split.target_hidden.reshape(
                     -1, split.target_hidden.shape[-1]
@@ -4752,6 +4774,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 bs, int(verify_input.draft_token_num)
             )
             append_commit_lens = commit_lens
+        self._dump_context(batch, next_target_hidden, next_target_positions, append_commit_lens)
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=next_target_hidden,
             cache_loc=batch.out_cache_loc,

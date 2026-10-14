@@ -488,6 +488,7 @@ class UzuTreeDumper:
         plain_check: bool = False,
         graph: bool = False,
         graph_check: bool = False,
+        context: bool = False,
     ) -> None:
         if graph and not internals:
             raise RuntimeError(
@@ -498,6 +499,8 @@ class UzuTreeDumper:
                 "The plain check runs with the eager internals dump only."
             )
         self.internals = internals
+        self.context = context
+        self._context_counts: dict[str, int] = {}
         self.plain_check = plain_check
         self.graph = graph
         self.graph_check = graph_check
@@ -1005,6 +1008,24 @@ class UzuTreeDumper:
         partial = path.with_name(path.name + ".part")
         with partial.open("wb") as handle:
             np.savez(handle, **arrays)
+        os.replace(partial, path)
+
+    def add_context(self, rid: str, rows: torch.Tensor, positions: torch.Tensor) -> None:
+        """Context rows entering the drafter's KV cache: context/<n>.npz with the rows as bf16 words and their
+        absolute positions, written at once (only diagnostic collections use it). A subdirectory, so that readers
+        counting the step files (*.npz) of the request directory do not see them."""
+        context_dir = self._request_dir(rid) / "context"
+        context_dir.mkdir(exist_ok=True)
+        count = self._context_counts.get(rid, 0)
+        self._context_counts[rid] = count + 1
+        path = context_dir / f"{count:06d}.npz"
+        partial = path.with_name(path.name + ".part")
+        with partial.open("wb") as handle:
+            np.savez(
+                handle,
+                context=_bf16_words(rows.float(), "the drafter's context rows"),
+                positions=positions.to("cpu", torch.int64).numpy(),
+            )
         os.replace(partial, path)
 
     def _request_dir(self, rid: str) -> Path:
